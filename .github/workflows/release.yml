@@ -81,7 +81,7 @@ jobs:
             apt_pkg: musl-tools
             linker: ""
           - target: aarch64-unknown-linux-musl
-            apt_pkg: "gcc-aarch64-linux-gnu qemu-user-static"
+            apt_pkg: gcc-aarch64-linux-gnu
             linker: aarch64-linux-gnu-gcc
     steps:
       - name: Checkout repository
@@ -104,6 +104,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y file ${{ matrix.apt_pkg }}
 
+      - name: Set up QEMU binfmt for arm64
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
       - name: Build static musl release binary
         shell: bash
         env:
@@ -114,12 +120,9 @@ jobs:
           fi
           cargo build --release --target ${{ matrix.target }}
           BIN="target/${{ matrix.target }}/release/easygre"
-          file "$BIN" | grep -q "statically linked"
-          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
-            qemu-aarch64-static "$BIN" --version
-          else
-            "$BIN" --version
-          fi
+          file "$BIN"
+          file "$BIN" | grep -qE "statically linked|static-pie linked"
+          "$BIN" --version
 
       - name: Package archive
         shell: bash

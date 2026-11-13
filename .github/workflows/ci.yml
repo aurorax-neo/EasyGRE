@@ -29,7 +29,12 @@ jobs:
       - name: Install cross toolchains and QEMU user-mode
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu qemu-user-static
+          sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu file
+
+      - name: Set up QEMU binfmt for arm64
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -55,18 +60,19 @@ jobs:
           cargo clippy --all-targets --target aarch64-unknown-linux-musl -- -D warnings
 
       - name: Run unit & fuzz test suite (x86_64)
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
         run: cargo test --target x86_64-unknown-linux-musl
 
       - name: Build and run unit & fuzz test suite on aarch64 (QEMU user-mode)
         shell: bash
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUNNER: qemu-aarch64-static
           RUSTFLAGS: -C target-feature=+crt-static
         run: |
           cargo test --target aarch64-unknown-linux-musl
           cargo build --release --target aarch64-unknown-linux-musl
-          qemu-aarch64-static target/aarch64-unknown-linux-musl/release/easygre --version
+          ./target/aarch64-unknown-linux-musl/release/easygre --version
 
   e2e-netns-and-docker:
     name: Netns E2E, Soak Smoke & Docker Build

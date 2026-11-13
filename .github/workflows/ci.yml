@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - "codex/**"
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-and-test:
+    name: Clippy, Unit & Fuzz, Multi-Arch Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Remove local package proxy in CI
+        shell: bash
+        run: rm -f .cargo/config.toml .cargo/config
+
+      - name: Install cross toolchains and QEMU user-mode
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu qemu-user-static
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+          targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
+
+      - name: Verify zero external dependencies
+        shell: bash
+        run: |
+          DEPS=$(awk '/^\[dependencies\]/{f=1;next} /^\[/{f=0} f && NF && $1 !~ /^#/' Cargo.toml)
+          if [ -n "$DEPS" ]; then
+            echo "::error::Cargo.toml [dependencies] must stay empty, found: $DEPS"
+            exit 1
+          fi
+
+      - name: Run Clippy on x86_64 and aarch64 musl targets
+        shell: bash
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
+        run: |
+          cargo clippy --all-targets --target x86_64-unknown-linux-musl -- -D warnings
+          cargo clippy --all-targets --target aarch64-unknown-linux-musl -- -D warnings
+
+      - name: Run unit & fuzz test suite (x86_64)
+        run: cargo test --target x86_64-unknown-linux-musl
+
+      - name: Build and run unit & fuzz test suite on aarch64 (QEMU user-mode)
+        shell: bash
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUNNER: qemu-aarch64-static
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: |
+          cargo test --target aarch64-unknown-linux-musl
+          cargo build --release --target aarch64-unknown-linux-musl
+          qemu-aarch64-static target/aarch64-unknown-linux-musl/release/easygre --version
+
+  e2e-netns-and-docker:
+    name: Netns E2E, Soak Smoke & Docker Build
+    needs: lint-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Remove local package proxy in CI
+        shell: bash
+        run: rm -f .cargo/config.toml .cargo/config
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools iproute2 iputils-ping iperf3 python3
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Build static release binary
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: Run 11-step Linux netns E2E verification
+        run: sudo ./scripts/e2e_netns_test.sh ./target/x86_64-unknown-linux-musl/release/easygre
+
+      - name: Run short soak & DDNS live switch smoke test
+        env:
+          SOAK_DURATION_SECS: "20"
+          SAMPLE_INTERVAL_SECS: "5"
+        run: sudo -E ./scripts/soak_test.sh ./target/x86_64-unknown-linux-musl/release/easygre
+
+      - name: Verify local Dockerfile and Dockerfile.release builds
+        shell: bash
+        run: |
+          docker build -t easygre:ci-local .
+          docker run --rm easygre:ci-local --version
+          mkdir -p docker-bin/amd64
+          cp ./target/x86_64-unknown-linux-musl/release/easygre docker-bin/amd64/easygre
+          docker build -f Dockerfile.release -t easygre:ci-release .
+          docker run --rm easygre:ci-release --version

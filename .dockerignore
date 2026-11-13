@@ -1,0 +1,11 @@
+target
+release-packages
+.git
+.gitignore
+.github
+.env
+.env.*
+docs
+scripts
+*.swp
+*.tmp

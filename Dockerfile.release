@@ -1,0 +1,20 @@
+# Multi-arch release packaging Dockerfile.
+# Copies pre-compiled static musl binaries without running QEMU compilation or apk network fetches.
+ARG PREP_IMAGE=alpine:3.21
+FROM --platform=$BUILDPLATFORM ${PREP_IMAGE} AS prep
+ARG TARGETARCH
+
+COPY docker-bin/${TARGETARCH}/easygre /tmp/easygre-bin
+RUN install -d -m 1777 /rootfs/tmp \
+    && install -d -m 0700 /rootfs/run/easygre \
+    && install -d -m 0755 /rootfs/etc \
+    && install -m 0755 /tmp/easygre-bin /rootfs/easygre
+
+FROM scratch
+
+COPY --from=prep /rootfs /
+
+HEALTHCHECK --interval=15s --timeout=3s --start-period=5s --retries=3 \
+    CMD ["/easygre", "healthcheck"]
+
+ENTRYPOINT ["/easygre"]

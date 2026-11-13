@@ -1,0 +1,303 @@
+name: Release & Publish
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "发布版本号 (例如 v0.1.0)"
+        required: false
+        default: "v0.1.0"
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate-release:
+    name: Validate Tag, Version & CHANGELOG
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Validate tag format (SemVer)
+        shell: bash
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Tag '$TAG' 不符合 SemVer（应为 vX.Y.Z 或 vX.Y.Z-pre）"
+            exit 1
+          fi
+
+      - name: Verify Cargo.toml version matches Tag
+        shell: bash
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          VER="${TAG#v}"
+          SRC_VER=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
+          if [ "$SRC_VER" != "$VER" ]; then
+            echo "::error::Cargo.toml version=$SRC_VER 与 Tag=$VER 不一致"
+            exit 1
+          fi
+
+      - name: Verify non-empty CHANGELOG entry
+        shell: bash
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          VER="${TAG#v}"
+          VER_ESC="${VER//./\\.}"
+          if ! grep -qE "^##[[:space:]]*\[?${VER_ESC}\]?([[:space:]]|$|-)" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md 缺少版本 $VER 的条目，请先补充后重推 Tag"
+            exit 1
+          fi
+          BODY=$(awk -v ver="$VER_ESC" '
+            $0 ~ "^##[ \t]*\\[?"ver"\\]?([ \t]|$|-)" {flag=1; next}
+            flag && /^## / {exit}
+            flag && NF {print}
+          ' CHANGELOG.md)
+          if [ -z "${BODY//[[:space:]]/}" ]; then
+            echo "::error::CHANGELOG.md 中版本 $VER 内容为空"
+            exit 1
+          fi
+
+  build-binaries:
+    name: Build Binary (${{ matrix.target }})
+    needs: validate-release
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            apt_pkg: musl-tools
+            linker: ""
+          - target: aarch64-unknown-linux-musl
+            apt_pkg: "gcc-aarch64-linux-gnu qemu-user-static"
+            linker: aarch64-linux-gnu-gcc
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Remove local package proxy in CI
+        shell: bash
+        run: rm -f .cargo/config.toml .cargo/config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compile toolchain
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y file ${{ matrix.apt_pkg }}
+
+      - name: Build static musl release binary
+        shell: bash
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: |
+          if [ -n "${{ matrix.linker }}" ]; then
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="${{ matrix.linker }}"
+          fi
+          cargo build --release --target ${{ matrix.target }}
+          BIN="target/${{ matrix.target }}/release/easygre"
+          file "$BIN" | grep -q "statically linked"
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
+            qemu-aarch64-static "$BIN" --version
+          else
+            "$BIN" --version
+          fi
+
+      - name: Package archive
+        shell: bash
+        run: |
+          TAG_NAME="${{ inputs.tag || github.ref_name }}"
+          [ "$TAG_NAME" = "" ] || [ "$TAG_NAME" = "main" ] && TAG_NAME="dev"
+          PKG_NAME="easygre_${TAG_NAME}_${{ matrix.target }}"
+          ROOT_DIR="$(pwd)"
+          mkdir -p "${ROOT_DIR}/release-packages" release-pkg
+
+          cp "target/${{ matrix.target }}/release/easygre" release-pkg/easygre
+          chmod 0755 release-pkg/easygre
+          for f in README.md LICENSE CHANGELOG.md .env.example docker-compose.yml; do
+            cp "$f" release-pkg/ 2>/dev/null || true
+          done
+
+          cd release-pkg
+          tar -czvf "${ROOT_DIR}/release-packages/${PKG_NAME}.tar.gz" *
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ matrix.target }}
+          path: release-packages/*
+          retention-days: 1
+
+  publish-release:
+    name: Publish GitHub Release Assets
+    needs: build-binaries
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Validate tag, Cargo.toml version & extract CHANGELOG body
+        id: changelog
+        shell: bash
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Tag '$TAG' 不符合 SemVer（应为 vX.Y.Z 或 vX.Y.Z-pre）"
+            exit 1
+          fi
+          VER="${TAG#v}"
+          SRC_VER=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
+          if [ "$SRC_VER" != "$VER" ]; then
+            echo "::error::Cargo.toml version=$SRC_VER 与 Tag=$VER 不一致"
+            exit 1
+          fi
+          VER_ESC="${VER//./\\.}"
+          if ! grep -qE "^##[[:space:]]*\[?${VER_ESC}\]?([[:space:]]|$|-)" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md 缺少版本 $VER 的条目，请先补充后重推 Tag"
+            exit 1
+          fi
+          BODY=$(awk -v ver="$VER_ESC" '
+            $0 ~ "^##[ \t]*\\[?"ver"\\]?([ \t]|$|-)" {flag=1; next}
+            flag && /^## / {exit}
+            flag {
+              if (NF) {
+                if (started && blank) printf "\n"
+                print
+                started=1
+                blank=0
+              } else if (started) {
+                blank=1
+              }
+            }
+          ' CHANGELOG.md)
+          if [ -z "${BODY//[[:space:]]/}" ]; then
+            echo "::error::CHANGELOG.md 中版本 $VER 内容为空"
+            exit 1
+          fi
+          { echo "body<<__EOF__"; echo "$BODY"; echo "__EOF__"; } >> "$GITHUB_OUTPUT"
+
+      - name: Download all package artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: downloaded-artifacts
+          pattern: package-*
+          merge-multiple: true
+
+      - name: Generate SHA256 checksums
+        shell: bash
+        run: |
+          mkdir -p release-assets
+          cp downloaded-artifacts/* release-assets/
+          cd release-assets && sha256sum * > checksums.txt
+
+      - name: Upload assets to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          body: ${{ steps.changelog.outputs.body }}
+          generate_release_notes: false
+          draft: false
+          prerelease: ${{ contains(inputs.tag || github.ref_name, '-') }}
+
+  docker:
+    name: Publish Multi-arch Docker Image to GHCR
+    needs: build-binaries
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Download linux-amd64 binary artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: package-x86_64-unknown-linux-musl
+          path: pkg-amd64
+
+      - name: Download linux-arm64 binary artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: package-aarch64-unknown-linux-musl
+          path: pkg-arm64
+
+      - name: Prepare multi-arch binaries
+        shell: bash
+        run: |
+          mkdir -p docker-bin/amd64 docker-bin/arm64
+          tar -xvf pkg-amd64/*.tar.gz -C docker-bin/amd64/
+          tar -xvf pkg-arm64/*.tar.gz -C docker-bin/arm64/
+          chmod +x docker-bin/amd64/easygre docker-bin/arm64/easygre
+          ls -la docker-bin/amd64/ docker-bin/arm64/
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry (GHCR)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/easygre
+          tags: |
+            type=semver,pattern={{version}},value=${{ inputs.tag || github.ref_name }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ inputs.tag || github.ref_name }}
+            type=raw,value=latest,enable=${{ !contains(inputs.tag || github.ref_name, '-') && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') || inputs.tag != '') }}
+
+      - name: Build and push multi-arch image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.release
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Record image digest
+        shell: bash
+        run: |
+          OWNER="${{ github.repository_owner }}"
+          IMAGE="ghcr.io/${OWNER,,}/easygre"
+          TAG="${{ inputs.tag || github.ref_name }}"
+          DIGEST="${{ steps.build.outputs.digest }}"
+          if [ -z "$DIGEST" ]; then
+            DIGEST=$(docker buildx imagetools inspect "${IMAGE}:${TAG#v}" --format '{{json .Manifest}}' \
+                     | jq -r '.digest' 2>/dev/null || echo "unknown")
+          fi
+          {
+            echo "### Multi-arch image published"
+            echo "- Image: \`${IMAGE}:${TAG#v}\`"
+            echo "- Digest: \`${DIGEST}\`"
+            echo "- Platforms: linux/amd64, linux/arm64"
+          } >> "$GITHUB_STEP_SUMMARY"

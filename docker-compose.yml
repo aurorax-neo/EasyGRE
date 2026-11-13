@@ -1,0 +1,36 @@
+services:
+  easygre:
+    build:
+      context: .
+      args:
+        RUST_IMAGE: ${RUST_IMAGE:-rust:1-alpine}
+    image: easygre:latest
+    container_name: easygre
+    restart: unless-stopped
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      GRE_ENABLED: ${GRE_ENABLED:-}
+      GRE_NAME: ${GRE_NAME:-}
+      GRE_COMMENT: ${GRE_COMMENT:-}
+      GRE_LOCAL: ${GRE_LOCAL:-}
+      GRE_PUBLIC_IP: ${GRE_PUBLIC_IP:-}
+      GRE_REMOTE: ${GRE_REMOTE:-}
+      GRE_IPSEC_SECRET: ${GRE_IPSEC_SECRET:-}
+      GRE_ADDR: ${GRE_ADDR:-}
+      GRE_ROUTE: ${GRE_ROUTE:-}
+      GRE_MTU: ${GRE_MTU:-}
+      GRE_KEEPALIVE: ${GRE_KEEPALIVE:-}
+      GRE_DSCP: ${GRE_DSCP:-}
+      GRE_DONT_FRAGMENT: ${GRE_DONT_FRAGMENT:-}
+      GRE_CLAMP_TCP_MSS: ${GRE_CLAMP_TCP_MSS:-}
+      GRE_ALLOW_FAST_PATH: ${GRE_ALLOW_FAST_PATH:-}
+      GRE_DNS_REFRESH: ${GRE_DNS_REFRESH:-}
+      GRE_TX_MODE: ${GRE_TX_MODE:-}
+      GRE_QUEUES: ${GRE_QUEUES:-}
+      GRE_STATUS_FILE: ${GRE_STATUS_FILE:-}
+      GRE_TUNNELS: ${GRE_TUNNELS:-}

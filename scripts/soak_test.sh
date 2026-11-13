@@ -138,7 +138,7 @@ HAVE_IPERF3=0
 if command -v iperf3 >/dev/null 2>&1; then
     HAVE_IPERF3=1
     start_iperf_srv
-    timeout 8 ip netns exec "$NS_A" iperf3 -c 172.16.99.2 --connect-timeout 3000 -P 4 -t 2 >/dev/null || start_iperf_srv
+    timeout -k 2 8 ip netns exec "$NS_A" iperf3 -c 172.16.99.2 --connect-timeout 3000 -P 4 -t 2 >/dev/null || start_iperf_srv
 fi
 
 BASE_RSS_KB="$(read_rss_kb "$PID_A")"
@@ -159,10 +159,10 @@ while [[ "$(date +%s)" -lt "$END_TS" ]]; do
     if [[ "$HAVE_IPERF3" -eq 1 && "$WIN" -ge 3 ]]; then
         TCP_TIME=$((WIN - 1))
         [[ "$TCP_TIME" -gt 10 ]] && TCP_TIME=10
-        if ! timeout $((TCP_TIME + 6)) ip netns exec "$NS_A" iperf3 -c 172.16.99.2 --connect-timeout 3000 -P 4 -t "$TCP_TIME" >/tmp/easygre_soak_iperf_tcp.log 2>&1; then
+        if ! timeout -k 2 $((TCP_TIME + 6)) ip netns exec "$NS_A" iperf3 -c 172.16.99.2 --connect-timeout 3000 -P 4 -t "$TCP_TIME" >/tmp/easygre_soak_iperf_tcp.log 2>&1; then
             start_iperf_srv
         fi
-        if ! timeout 8 ip netns exec "$NS_A" iperf3 -c 172.16.99.2 --connect-timeout 3000 -u -b "$UDP_RATE" -t 2 >/tmp/easygre_soak_iperf_udp.log 2>&1; then
+        if ! timeout -k 2 8 ip netns exec "$NS_A" iperf3 -c 172.16.99.2 --connect-timeout 3000 -u -b "$UDP_RATE" -t 2 >/tmp/easygre_soak_iperf_udp.log 2>&1; then
             start_iperf_srv
         fi
     else

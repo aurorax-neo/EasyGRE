@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Long-duration stability, leak & DDNS live-switch soak test for EasyGRE.
 # Usage:
-#   sudo SOAK_DURATION_SECS=86400 ./scripts/soak_test.sh [path/to/easygre]
+#   sudo env SOAK_DURATION_SECS=86400 ./scripts/soak_test.sh [path/to/easygre]
 
 if [[ "$(uname -s)" != "Linux" ]]; then
     echo "soak_test.sh requires Linux with root privileges."

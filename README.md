@@ -192,7 +192,7 @@ sudo ./scripts/e2e_netns_test.sh
 - 长时间稳定性与 DDNS 热切换压测（默认 24 小时，可通过 `SOAK_DURATION_SECS` 自定义时长）：
 
 ```bash
-sudo SOAK_DURATION_SECS=86400 ./scripts/soak_test.sh
+sudo env SOAK_DURATION_SECS=86400 ./scripts/soak_test.sh
 ```
 
 ## 延伸文档

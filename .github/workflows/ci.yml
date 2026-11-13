@@ -105,11 +105,9 @@ jobs:
         run: sudo ./scripts/e2e_netns_test.sh ./target/x86_64-unknown-linux-musl/release/easygre
 
       - name: Run short soak & DDNS live switch smoke test
-        env:
-          SOAK_DURATION_SECS: "20"
-          SAMPLE_INTERVAL_SECS: "5"
-          UDP_RATE: "50M"
-        run: sudo -E ./scripts/soak_test.sh ./target/x86_64-unknown-linux-musl/release/easygre
+        run: |
+          sudo env SOAK_DURATION_SECS=20 SAMPLE_INTERVAL_SECS=5 UDP_RATE=50M \
+            ./scripts/soak_test.sh ./target/x86_64-unknown-linux-musl/release/easygre
 
       - name: Verify local Dockerfile and Dockerfile.release builds
         shell: bash

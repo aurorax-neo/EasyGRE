@@ -38,7 +38,10 @@ PID_TCP_LOAD=""
 
 cleanup() {
     set +e
-    for p in "$PID_TCP_LOAD" "$PID_IPERF_SRV" "$PID_A" "$PID_B"; do
+    for p in "$PID_TCP_LOAD" "$PID_IPERF_SRV"; do
+        [[ -n "$p" ]] && kill -9 "$p" 2>/dev/null && wait "$p" 2>/dev/null
+    done
+    for p in "$PID_A" "$PID_B"; do
         [[ -n "$p" ]] && kill "$p" 2>/dev/null && wait "$p" 2>/dev/null
     done
     ip netns del "$NS_A" 2>/dev/null
@@ -123,7 +126,7 @@ ip netns exec "$NS_A" ping -6 -c 4 -i 0.1 -W 1 fd00:99::2 >/dev/null
 
 start_iperf_srv() {
     if [[ -n "$PID_IPERF_SRV" ]]; then
-        kill "$PID_IPERF_SRV" 2>/dev/null || true
+        kill -9 "$PID_IPERF_SRV" 2>/dev/null || true
         wait "$PID_IPERF_SRV" 2>/dev/null || true
     fi
     ip netns exec "$NS_B" iperf3 -s >/tmp/easygre_soak_iperf_srv.log 2>&1 &

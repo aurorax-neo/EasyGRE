@@ -121,13 +121,21 @@ read_fd_count() {
 ip netns exec "$NS_A" ping -c 4 -i 0.1 -W 1 172.16.99.2 >/dev/null
 ip netns exec "$NS_A" ping -6 -c 4 -i 0.1 -W 1 fd00:99::2 >/dev/null
 
+start_iperf_srv() {
+    if [[ -n "$PID_IPERF_SRV" ]]; then
+        kill "$PID_IPERF_SRV" 2>/dev/null || true
+        wait "$PID_IPERF_SRV" 2>/dev/null || true
+    fi
+    ip netns exec "$NS_B" iperf3 -s >/tmp/easygre_soak_iperf_srv.log 2>&1 &
+    PID_IPERF_SRV=$!
+    sleep 0.2
+}
+
 HAVE_IPERF3=0
 if command -v iperf3 >/dev/null 2>&1; then
     HAVE_IPERF3=1
-    ip netns exec "$NS_B" iperf3 -s >/tmp/easygre_soak_iperf_srv.log 2>&1 &
-    PID_IPERF_SRV=$!
-    sleep 0.3
-    ip netns exec "$NS_A" iperf3 -c 172.16.99.2 --connect-timeout 3000 -P 4 -t 2 >/dev/null
+    start_iperf_srv
+    timeout 8 ip netns exec "$NS_A" iperf3 -c 172.16.99.2 --connect-timeout 3000 -P 4 -t 2 >/dev/null || start_iperf_srv
 fi
 
 BASE_RSS_KB="$(read_rss_kb "$PID_A")"
@@ -148,8 +156,12 @@ while [[ "$(date +%s)" -lt "$END_TS" ]]; do
     if [[ "$HAVE_IPERF3" -eq 1 && "$WIN" -ge 3 ]]; then
         TCP_TIME=$((WIN - 1))
         [[ "$TCP_TIME" -gt 10 ]] && TCP_TIME=10
-        ip netns exec "$NS_A" iperf3 -c 172.16.99.2 --connect-timeout 3000 -P 4 -t "$TCP_TIME" >/tmp/easygre_soak_iperf_tcp.log 2>&1
-        ip netns exec "$NS_A" iperf3 -c 172.16.99.2 -u -b "$UDP_RATE" -t 2 >/tmp/easygre_soak_iperf_udp.log 2>&1
+        if ! timeout $((TCP_TIME + 6)) ip netns exec "$NS_A" iperf3 -c 172.16.99.2 --connect-timeout 3000 -P 4 -t "$TCP_TIME" >/tmp/easygre_soak_iperf_tcp.log 2>&1; then
+            start_iperf_srv
+        fi
+        if ! timeout 8 ip netns exec "$NS_A" iperf3 -c 172.16.99.2 --connect-timeout 3000 -u -b "$UDP_RATE" -t 2 >/tmp/easygre_soak_iperf_udp.log 2>&1; then
+            start_iperf_srv
+        fi
     else
         ip netns exec "$NS_A" ping -c 10 -i 0.1 -W 1 172.16.99.2 >/dev/null
         ip netns exec "$NS_A" ping -6 -c 10 -i 0.1 -W 1 fd00:99::2 >/dev/null

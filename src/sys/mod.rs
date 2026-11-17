@@ -14,12 +14,13 @@ mod stub;
 use stub as imp;
 
 pub use imp::{
-    cleanup_stale_easygre_routes, get_interface_hwaddr, install_host_bypass_route, is_pid_alive,
-    lookup_arp_mac, monotonic_now_secs, probe_route_excluding, remove_host_bypass_route,
-    remove_installed_route, trigger_arp_probe, Epoll, EventFd, InstalledRoute, InstanceLease,
-    NeighWatchSocket, PacketTxRing, RawGreSocket, RxBatchBuffer, TunDevice, TunUringReader,
-    BATCH_CAP,
-    BATCH_SLOT_SIZE, TSO_OVERFLOW_SIZE, URING_BATCH,
+    bind_nonblock_tcp_listener, bind_socket_to_device, check_socket_connect_err,
+    cleanup_stale_easygre_routes, enable_ip_forwarding, get_interface_hwaddr,
+    install_host_bypass_route, is_pid_alive, list_host_local_ips, lookup_arp_mac,
+    monotonic_now_secs, open_nonblock_tcp_stream, probe_route_excluding, remove_host_bypass_route,
+    remove_installed_route, trigger_arp_probe, Epoll, EpollReady, EventFd, InstalledRoute,
+    InstanceLease, NeighWatchSocket, PacketTxRing, RawGreSocket, RawIcmpSocket, RxBatchBuffer,
+    TunDevice, TunUringReader, BATCH_CAP, BATCH_SLOT_SIZE, TSO_OVERFLOW_SIZE, URING_BATCH,
 };
 
 #[derive(Debug, Clone)]

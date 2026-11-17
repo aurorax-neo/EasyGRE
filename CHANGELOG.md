@@ -6,6 +6,17 @@
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-17
+
+### Features
+- 新增自适应多层 Keepalive 穿透机制（`gre-in-gre`、`in-tunnel-icmp-echo`、`in-tunnel-ttl1`、`udp-in-gre`），彻底解决对端位于 1:1 NAT + `srcnat masquerade` 后因 GREv0 `nf_conntrack` 元组冲突丢弃回弹包导致的载波闪断问题，保持 `GRE_KEEPALIVE=10s,10` 默认开启且兼容 Linux `ip_gre` / RouterOS 对端。
+- 新增零内核 `netfilter` 依赖的纯用户态内置 NAT44/NAT66 与端口映射引擎：支持 `--nat out|exit|both`（`GRE_NAT`）与 `--dnat`（`GRE_DNAT`），完整支持 IPv4/IPv6 TCP（兼容 64 KB TSO/GRO）、UDP、ICMP Echo 及关联 ICMP Error 引用头转换，并自动开启三层转发。
+- 支持 CLI 与 `--tunnel` 配置中重复传入 `--route`、`--addr`、`--dnat` 自动累加去重。
+
+### Testing
+- Linux 网络命名空间实网 E2E 测试扩展至 13 步，新增 1:1 NAT + `MASQUERADE` + Linux 原生 `ip_gre` 保活穿透测试及零 `netfilter` 规则的纯用户态 NAT44/NAT66 + DNAT 双栈端到端测试。
+- 新增用户态 NAT44/NAT66（含 ICMP Error 引用头还原、TCP 门户转换及 20,000 轮随机变异校验和不变量）与多层 Keepalive 报文单元/模糊测试套件。
+
 ## [0.1.0] - 2026-11-13
 
 ### Features

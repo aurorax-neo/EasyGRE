@@ -4,6 +4,7 @@ mod config;
 mod engine;
 mod gre;
 mod keepalive;
+mod nat;
 mod packet;
 mod status;
 mod sys;

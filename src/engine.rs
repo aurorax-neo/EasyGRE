@@ -1,23 +1,28 @@
 use std::collections::BTreeMap;
 use std::io::ErrorKind;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::config::{
-    AppConfig, DontFragmentMode, DscpMode, MtuMode, RemoteEndpoint, RouteSpec, TunnelConfig, TxMode,
+    AppConfig, DontFragmentMode, DscpMode, MtuMode, NatMode, RemoteEndpoint, RouteGateway,
+    RouteSpec, TunnelConfig, TxMode,
 };
 use crate::gre::{
-    build_keepalive_reply, build_keepalive_request_with_token, decode_gre_payload, GreDecoded,
-    ETHERTYPE_IPV4, ETHERTYPE_IPV6, IPPROTO_GRE,
+    build_in_tunnel_hoplimit1_v6_probe, build_in_tunnel_icmpv4_echo, build_in_tunnel_icmpv6_echo,
+    build_in_tunnel_keepalive_reply, build_in_tunnel_ttl1_v4_probe, build_keepalive_reply,
+    build_keepalive_request_with_token, build_udp_in_gre_keepalive, decode_gre_payload,
+    parse_truncated_ttl1_icmpv4, parse_udp_keepalive_payload, ttl1_probe_fields_from_token,
+    GreDecoded, KeepaliveReplyKind, PeerTunnelIp, ETHERTYPE_IPV4, ETHERTYPE_IPV6, IPPROTO_GRE,
 };
-use crate::keepalive::{KeepaliveConfig, KeepaliveStateMachine};
+use crate::keepalive::{random_u64, KeepaliveConfig, KeepaliveStateMachine};
+use crate::nat::{run_nat_relay_worker, InboundNatOutcome, NatRelayListeners, TunnelNatEngine};
 use crate::packet::{
     build_icmp_pkt_too_big, clamp_tcp_mss, finish_partial_checksum, inspect_inner_ip,
     is_valid_unicast_ipv4, packet_flow_hash, parse_outer_ipv4, segment_tso_into,
-    write_outer_ipv4_gre_header, IpVersion, RxGroMerger, TxSlotSink, VnetHdr,
+    write_outer_ipv4_gre_header, IpCidr, IpVersion, RxGroMerger, TxSlotSink, VnetHdr,
     VIRTIO_NET_HDR_GSO_NONE, VNET_HDR_LEN,
 };
 use crate::status::{
@@ -25,16 +30,17 @@ use crate::status::{
 };
 use crate::sys::{
     cleanup_stale_easygre_routes, configure_interface_addr, configure_route,
-    detect_system_warnings, get_interface_hwaddr, install_host_bypass_route,
+    detect_system_warnings, enable_ip_forwarding, get_interface_hwaddr, install_host_bypass_route,
     install_signal_handlers, is_pid_alive, lookup_arp_mac, probe_route_excluding,
     remove_host_bypass_route, remove_installed_route, shutdown_requested, trigger_arp_probe,
     Epoll, EventFd, InstalledRoute, InstanceLease, NeighWatchSocket, PacketTxRing, RawGreSocket,
-    RxBatchBuffer, TunDevice,
-    TunUringReader, BATCH_CAP, BATCH_SLOT_SIZE, TSO_OVERFLOW_SIZE, URING_BATCH,
+    RxBatchBuffer, TunDevice, TunUringReader, BATCH_CAP, BATCH_SLOT_SIZE, TSO_OVERFLOW_SIZE,
+    URING_BATCH,
 };
 
 const TOKEN_EVENT_FD: u64 = 1;
 const TOKEN_NETLINK_NEIGH: u64 = 2;
+const TOKEN_KA_UDP: u64 = 3;
 const TOKEN_RAW_RX: u64 = u64::MAX;
 const GRE_OVERHEAD_V4: u16 = 24;
 const STATUS_FLUSH_INTERVAL: Duration = Duration::from_secs(2);
@@ -239,6 +245,141 @@ impl Drop for WorkerExitGuard {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KaReplyOutcome {
+    Accepted,
+    DuplicateCurrent,
+    Rejected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveProbePath {
+    GrePrimary,
+    InTunnelEcho,
+    InTunnelTtl1,
+    UdpBounce,
+}
+
+impl ActiveProbePath {
+    fn from_reply_kind(kind: KeepaliveReplyKind) -> Self {
+        match kind {
+            KeepaliveReplyKind::GrePt0 => Self::GrePrimary,
+            KeepaliveReplyKind::InTunnelEcho => Self::InTunnelEcho,
+            KeepaliveReplyKind::InTunnelTtl1 => Self::InTunnelTtl1,
+            KeepaliveReplyKind::UdpBounce => Self::UdpBounce,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::GrePrimary => "gre-in-gre",
+            Self::InTunnelEcho => "in-tunnel-icmp-echo",
+            Self::InTunnelTtl1 => "in-tunnel-ttl1",
+            Self::UdpBounce => "udp-in-gre",
+        }
+    }
+}
+
+#[inline]
+fn is_usable_unicast_ipv6(ip: Ipv6Addr) -> bool {
+    !ip.is_unspecified() && !ip.is_loopback() && !ip.is_multicast()
+}
+
+fn derive_tunnel_v4_endpoints(cfg: &TunnelConfig) -> (Option<(Ipv4Addr, u8)>, Option<Ipv4Addr>) {
+    let mut local_v4: Option<(Ipv4Addr, u8)> = None;
+    for cidr in &cfg.addresses {
+        if let IpCidr::V4 { addr, prefix_len } = *cidr {
+            if is_valid_unicast_ipv4(addr) {
+                local_v4 = Some((addr, prefix_len));
+                break;
+            }
+        }
+    }
+    let local_ip = local_v4.map(|(a, _)| a);
+    if let Some((addr, pfx)) = local_v4 {
+        let local_cidr = IpCidr::V4 {
+            addr,
+            prefix_len: pfx,
+        };
+        for r in &cfg.routes {
+            if let RouteGateway::Via(IpAddr::V4(gw)) = r.gateway {
+                if is_valid_unicast_ipv4(gw) && gw != addr && local_cidr.contains_v4(gw) {
+                    return (local_v4, Some(gw));
+                }
+            }
+        }
+    }
+    for r in &cfg.routes {
+        if let RouteGateway::Via(IpAddr::V4(gw)) = r.gateway {
+            if is_valid_unicast_ipv4(gw) && Some(gw) != local_ip {
+                return (local_v4, Some(gw));
+            }
+        }
+    }
+    let peer = match local_v4 {
+        Some((addr, 31)) => {
+            let p = Ipv4Addr::from(u32::from(addr) ^ 1);
+            if is_valid_unicast_ipv4(p) {
+                Some(p)
+            } else {
+                None
+            }
+        }
+        Some((addr, 30)) => {
+            let v = u32::from(addr);
+            let base = v & !3;
+            match v & 3 {
+                1 => Some(Ipv4Addr::from(base | 2)),
+                2 => Some(Ipv4Addr::from(base | 1)),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    (local_v4, peer)
+}
+
+fn derive_tunnel_v6_endpoints(cfg: &TunnelConfig) -> (Option<(Ipv6Addr, u8)>, Option<Ipv6Addr>) {
+    let mut local_v6: Option<(Ipv6Addr, u8)> = None;
+    for cidr in &cfg.addresses {
+        if let IpCidr::V6 { addr, prefix_len } = *cidr {
+            if is_usable_unicast_ipv6(addr) {
+                local_v6 = Some((addr, prefix_len));
+                break;
+            }
+        }
+    }
+    let local_ip = local_v6.map(|(a, _)| a);
+    for r in &cfg.routes {
+        if let RouteGateway::Via(IpAddr::V6(gw)) = r.gateway {
+            if is_usable_unicast_ipv6(gw) && Some(gw) != local_ip {
+                return (local_v6, Some(gw));
+            }
+        }
+    }
+    let peer = match local_v6 {
+        Some((addr, 127)) => {
+            let p = Ipv6Addr::from(u128::from(addr) ^ 1);
+            if is_usable_unicast_ipv6(p) {
+                Some(p)
+            } else {
+                None
+            }
+        }
+        Some((addr, 126)) => {
+            let v = u128::from(addr);
+            let base = v & !3;
+            match v & 3 {
+                1 => Some(Ipv6Addr::from(base | 2)),
+                2 => Some(Ipv6Addr::from(base | 1)),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    (local_v6, peer)
+}
+
 struct TunnelShared {
     name: String,
     epoch: Instant,
@@ -249,6 +390,15 @@ struct TunnelShared {
     clamp_tcp_mss: bool,
     allow_fast_path: bool,
     actual_mtu: u16,
+    ka_daemon_tag: u32,
+    local_v4_addrs: Vec<Ipv4Addr>,
+    local_v6_addrs: Vec<Ipv6Addr>,
+    tun_v4_local: Option<(Ipv4Addr, u8)>,
+    tun_v4_peer_static: Option<Ipv4Addr>,
+    tun_v4_peer_learned: AtomicU32,
+    tun_v6_local: Option<(Ipv6Addr, u8)>,
+    tun_v6_peer_static: Option<Ipv6Addr>,
+    tun_v6_peer_learned: Mutex<Option<Ipv6Addr>>,
     out_mtu: AtomicU32,
     out_ifindex: AtomicU32,
     src_mac: AtomicU64,
@@ -264,6 +414,9 @@ struct TunnelShared {
     ka_ring_cursor: AtomicU32,
     ka_expected_tokens: [AtomicU32; 4],
     ka_expected_seqs: [AtomicU32; 4],
+    ka_current_tok: AtomicU32,
+    ka_last_accepted_tok: AtomicU32,
+    ka_last_reply_kind: AtomicU32,
     tx_packets: AtomicU64,
     rx_packets: AtomicU64,
     tx_drops: AtomicU64,
@@ -273,6 +426,7 @@ struct TunnelShared {
     ka_requests_ans: AtomicU64,
     ka_spoof_drops: AtomicU64,
     emsgsize_warned: AtomicBool,
+    nat: Option<Arc<TunnelNatEngine>>,
     tun: TunDevice,
 }
 
@@ -281,26 +435,32 @@ impl TunnelShared {
         let idx = (self.ka_ring_cursor.fetch_add(1, Ordering::Relaxed) as usize) & 3;
         self.ka_expected_seqs[idx].store(seq as u32, Ordering::Release);
         self.ka_expected_tokens[idx].store(token, Ordering::Release);
+        self.ka_current_tok.store(token, Ordering::Release);
+        self.ka_last_accepted_tok.store(0, Ordering::Release);
         self.ka_awaiting.store(true, Ordering::Release);
     }
 
-    fn verify_ka_reply(
+    fn check_ka_reply(
         &self,
+        kind: KeepaliveReplyKind,
+        daemon_tag: Option<u32>,
         echo_token: Option<[u8; 4]>,
         body_len: usize,
         outer_ip_id: u16,
-    ) -> bool {
-        if !self.ka_awaiting.load(Ordering::Acquire) {
-            return false;
+    ) -> KaReplyOutcome {
+        if let Some(tag) = daemon_tag {
+            if tag != self.ka_daemon_tag {
+                return KaReplyOutcome::Rejected;
+            }
         }
-        let matched = if let Some(tb) = echo_token {
-            let tok = u32::from_be_bytes(tb);
-            tok != 0
+        let tok_val = echo_token.map(u32::from_be_bytes).unwrap_or(0);
+        let token_matches_ring = if echo_token.is_some() {
+            tok_val != 0
                 && self
                     .ka_expected_tokens
                     .iter()
-                    .any(|slot| slot.load(Ordering::Acquire) == tok)
-        } else if body_len == 0 {
+                    .any(|slot| slot.load(Ordering::Acquire) == tok_val)
+        } else if body_len == 0 && kind == KeepaliveReplyKind::GrePt0 {
             outer_ip_id != 0
                 && self
                     .ka_expected_seqs
@@ -309,10 +469,202 @@ impl TunnelShared {
         } else {
             false
         };
-        if matched {
-            self.ka_awaiting.store(false, Ordering::Release);
+        if !token_matches_ring {
+            return KaReplyOutcome::Rejected;
         }
-        matched
+        if self.ka_awaiting.swap(false, Ordering::AcqRel) {
+            if tok_val != 0 {
+                self.ka_last_accepted_tok.store(tok_val, Ordering::Release);
+            }
+            self.ka_last_reply_kind
+                .store(kind as u32, Ordering::Release);
+            KaReplyOutcome::Accepted
+        } else if tok_val != 0
+            && tok_val == self.ka_current_tok.load(Ordering::Acquire)
+            && tok_val == self.ka_last_accepted_tok.load(Ordering::Acquire)
+        {
+            KaReplyOutcome::DuplicateCurrent
+        } else {
+            KaReplyOutcome::Rejected
+        }
+    }
+
+    #[cfg(test)]
+    fn verify_ka_reply(
+        &self,
+        echo_token: Option<[u8; 4]>,
+        body_len: usize,
+        outer_ip_id: u16,
+    ) -> bool {
+        matches!(
+            self.check_ka_reply(
+                KeepaliveReplyKind::GrePt0,
+                None,
+                echo_token,
+                body_len,
+                outer_ip_id,
+            ),
+            KaReplyOutcome::Accepted
+        )
+    }
+
+    fn last_reply_kind(&self) -> KeepaliveReplyKind {
+        KeepaliveReplyKind::from_u32(self.ka_last_reply_kind.load(Ordering::Acquire))
+            .unwrap_or(KeepaliveReplyKind::GrePt0)
+    }
+
+    fn owns_in_tunnel_dst(&self, protocol: u16, inner_pkt: &[u8]) -> bool {
+        match protocol {
+            ETHERTYPE_IPV4 if inner_pkt.len() >= 20 => {
+                let dst = Ipv4Addr::new(
+                    inner_pkt[16],
+                    inner_pkt[17],
+                    inner_pkt[18],
+                    inner_pkt[19],
+                );
+                self.local_v4_addrs.contains(&dst)
+            }
+            ETHERTYPE_IPV6 if inner_pkt.len() >= 40 => {
+                let mut oct = [0u8; 16];
+                oct.copy_from_slice(&inner_pkt[24..40]);
+                let dst = Ipv6Addr::from(oct);
+                self.local_v6_addrs.contains(&dst)
+            }
+            _ => false,
+        }
+    }
+
+    #[inline]
+    fn observe_peer_tunnel_ip(&self, peer: PeerTunnelIp) {
+        match peer {
+            PeerTunnelIp::V4(ip) => self.observe_peer_tunnel_v4(ip),
+            PeerTunnelIp::V6(ip) => self.observe_peer_tunnel_v6(ip),
+        }
+    }
+
+    #[inline]
+    fn observe_peer_tunnel_v4(&self, candidate: Ipv4Addr) {
+        if self.tun_v4_peer_static.is_some()
+            || self.tun_v4_peer_learned.load(Ordering::Relaxed) != 0
+        {
+            return;
+        }
+        let Some((local_v4, pfx)) = self.tun_v4_local else {
+            return;
+        };
+        if candidate == local_v4 || !is_valid_unicast_ipv4(candidate) {
+            return;
+        }
+        let cidr = IpCidr::V4 {
+            addr: local_v4,
+            prefix_len: pfx,
+        };
+        if !cidr.contains_v4(candidate) {
+            return;
+        }
+        if pfx <= 30 {
+            let host_bits = 32 - pfx;
+            let host_mask = if pfx == 0 {
+                u32::MAX
+            } else {
+                (1u32 << host_bits) - 1
+            };
+            let host_part = u32::from(candidate) & host_mask;
+            if host_part == 0 || host_part == host_mask {
+                return;
+            }
+        }
+        self.tun_v4_peer_learned
+            .store(u32::from(candidate), Ordering::Release);
+    }
+
+    fn observe_peer_tunnel_v6(&self, candidate: Ipv6Addr) {
+        if self.tun_v6_peer_static.is_some() {
+            return;
+        }
+        let Some((local_v6, pfx)) = self.tun_v6_local else {
+            return;
+        };
+        if candidate == local_v6 || !is_usable_unicast_ipv6(candidate) {
+            return;
+        }
+        let mask = if pfx == 0 {
+            0u128
+        } else {
+            u128::MAX << (128 - pfx)
+        };
+        if (u128::from(candidate) & mask) != (u128::from(local_v6) & mask) {
+            return;
+        }
+        if let Ok(mut slot) = self.tun_v6_peer_learned.lock() {
+            if slot.is_none() {
+                *slot = Some(candidate);
+            }
+        }
+    }
+
+    #[inline]
+    fn maybe_learn_peer_from_data(&self, protocol: u16, inner_pkt: &[u8]) {
+        match protocol {
+            ETHERTYPE_IPV4
+                if self.tun_v4_peer_static.is_none()
+                    && self.tun_v4_local.is_some()
+                    && self.tun_v4_peer_learned.load(Ordering::Relaxed) == 0
+                    && inner_pkt.len() >= 20 =>
+            {
+                let src = Ipv4Addr::new(
+                    inner_pkt[12],
+                    inner_pkt[13],
+                    inner_pkt[14],
+                    inner_pkt[15],
+                );
+                self.observe_peer_tunnel_v4(src);
+            }
+            ETHERTYPE_IPV6
+                if self.tun_v6_peer_static.is_none()
+                    && self.tun_v6_local.is_some()
+                    && inner_pkt.len() >= 40 =>
+            {
+                if let Ok(slot) = self.tun_v6_peer_learned.lock() {
+                    if slot.is_some() {
+                        return;
+                    }
+                }
+                let mut oct = [0u8; 16];
+                oct.copy_from_slice(&inner_pkt[8..24]);
+                self.observe_peer_tunnel_v6(Ipv6Addr::from(oct));
+            }
+            _ => {}
+        }
+    }
+
+    fn try_consume_truncated_ttl1_reply(&self, inner_pkt: &[u8]) -> Option<KaReplyOutcome> {
+        if !self.ka_awaiting.load(Ordering::Relaxed)
+            || inner_pkt.len() < 56
+            || inner_pkt.len() >= 68
+            || inner_pkt.get(9) != Some(&1)
+        {
+            return None;
+        }
+        let (local_v4, _) = self.tun_v4_local?;
+        let (peer_src, q_id, q_sport) = parse_truncated_ttl1_icmpv4(inner_pkt, local_v4)?;
+        for slot in &self.ka_expected_tokens {
+            let tok = slot.load(Ordering::Acquire);
+            if tok != 0 && ttl1_probe_fields_from_token(tok) == (q_id, q_sport) {
+                let res = self.check_ka_reply(
+                    KeepaliveReplyKind::InTunnelTtl1,
+                    None,
+                    Some(tok.to_be_bytes()),
+                    4,
+                    0,
+                );
+                if matches!(res, KaReplyOutcome::Accepted) {
+                    self.observe_peer_tunnel_v4(peer_src);
+                }
+                return Some(res);
+            }
+        }
+        None
     }
 
     /// Require 2 consecutive matching valid unicast KeepaliveRequest inner source IPs
@@ -366,6 +718,10 @@ struct ManagedTunnel {
     shared: Arc<TunnelShared>,
     ka_tx_sock: RawGreSocket,
     keepalive: KeepaliveStateMachine,
+    probe_path: ActiveProbePath,
+    logged_probe_path: ActiveProbePath,
+    current_probe: Option<(u16, u32)>,
+    fallback_due_at: Option<Instant>,
     last_ka_replies_seen: u64,
     last_learned_public: u32,
     out_ifname: String,
@@ -397,6 +753,146 @@ impl ManagedTunnel {
             Ipv4Addr::from(learned)
         } else {
             self.local_ip()
+        }
+    }
+
+    fn fallback_delay(&self) -> Duration {
+        match self.cfg.keepalive {
+            KeepaliveConfig::Enabled { interval, .. } => (interval / 4)
+                .clamp(Duration::from_millis(150), Duration::from_millis(400)),
+            KeepaliveConfig::Disabled => Duration::from_millis(300),
+        }
+    }
+
+    fn has_in_tunnel_addr(&self) -> bool {
+        self.shared.tun_v4_local.is_some() || self.shared.tun_v6_local.is_some()
+    }
+
+    fn effective_peer_tun_v4(&self) -> Option<(Ipv4Addr, Ipv4Addr)> {
+        let (local_v4, _) = self.shared.tun_v4_local?;
+        if let Some(peer) = self.shared.tun_v4_peer_static {
+            return Some((local_v4, peer));
+        }
+        let learned = self.shared.tun_v4_peer_learned.load(Ordering::Acquire);
+        if learned != 0 {
+            Some((local_v4, Ipv4Addr::from(learned)))
+        } else {
+            None
+        }
+    }
+
+    fn effective_peer_tun_v6(&self) -> Option<(Ipv6Addr, Ipv6Addr)> {
+        let (local_v6, _) = self.shared.tun_v6_local?;
+        if let Some(peer) = self.shared.tun_v6_peer_static {
+            return Some((local_v6, peer));
+        }
+        let learned = self
+            .shared
+            .tun_v6_peer_learned
+            .lock()
+            .ok()
+            .and_then(|g| *g);
+        learned.map(|peer| (local_v6, peer))
+    }
+
+    fn send_gre_in_gre(&mut self, seq: u16, tok: u32) {
+        let remote_ip = self.remote_ip();
+        let pkt =
+            build_keepalive_request_with_token(remote_ip, self.effective_reply_dst_ip(), seq, tok);
+        let _ = self.ka_tx_sock.send_to(remote_ip, 0, false, &pkt);
+    }
+
+    fn send_in_tunnel_echo(&mut self, seq: u16, tok: u32) -> bool {
+        let remote_ip = self.remote_ip();
+        let tag = self.shared.ka_daemon_tag;
+        if let Some((local_v4, peer_v4)) = self.effective_peer_tun_v4() {
+            let pkt = build_in_tunnel_icmpv4_echo(local_v4, peer_v4, false, seq, tag, tok);
+            let _ = self.ka_tx_sock.send_to(remote_ip, 0, false, &pkt);
+            return true;
+        }
+        if let Some((local_v6, peer_v6)) = self.effective_peer_tun_v6() {
+            let pkt = build_in_tunnel_icmpv6_echo(local_v6, peer_v6, false, seq, tag, tok);
+            let _ = self.ka_tx_sock.send_to(remote_ip, 0, false, &pkt);
+            return true;
+        }
+        false
+    }
+
+    fn send_in_tunnel_ttl1(&mut self, tok: u32) -> bool {
+        let remote_ip = self.remote_ip();
+        let tag = self.shared.ka_daemon_tag;
+        if let Some((local_v4, _)) = self.shared.tun_v4_local {
+            let pkt =
+                build_in_tunnel_ttl1_v4_probe(local_v4, self.effective_reply_dst_ip(), tag, tok);
+            let _ = self.ka_tx_sock.send_to(remote_ip, 0, false, &pkt);
+            return true;
+        }
+        if let Some((local_v6, _)) = self.shared.tun_v6_local {
+            let pkt = build_in_tunnel_hoplimit1_v6_probe(local_v6, local_v6, tag, tok);
+            let _ = self.ka_tx_sock.send_to(remote_ip, 0, false, &pkt);
+            return true;
+        }
+        false
+    }
+
+    fn send_udp_bounce(&mut self, seq: u16, tok: u32, ka_udp_port: u16) -> bool {
+        if ka_udp_port == 0 {
+            return false;
+        }
+        let remote_ip = self.remote_ip();
+        let pkt = build_udp_in_gre_keepalive(
+            remote_ip,
+            self.effective_reply_dst_ip(),
+            ka_udp_port,
+            seq,
+            self.shared.ka_daemon_tag,
+            tok,
+        );
+        let _ = self.ka_tx_sock.send_to(remote_ip, 0, false, &pkt);
+        true
+    }
+
+    fn send_primary_probe(&mut self, seq: u16, tok: u32, ka_udp_port: u16) {
+        match self.probe_path {
+            ActiveProbePath::GrePrimary => self.send_gre_in_gre(seq, tok),
+            ActiveProbePath::InTunnelEcho => {
+                if !self.send_in_tunnel_echo(seq, tok) {
+                    self.probe_path = ActiveProbePath::GrePrimary;
+                    self.send_gre_in_gre(seq, tok);
+                }
+            }
+            ActiveProbePath::InTunnelTtl1 => {
+                if !self.send_in_tunnel_ttl1(tok) {
+                    self.probe_path = ActiveProbePath::GrePrimary;
+                    self.send_gre_in_gre(seq, tok);
+                }
+            }
+            ActiveProbePath::UdpBounce => {
+                if !self.send_udp_bounce(seq, tok, ka_udp_port) {
+                    self.probe_path = ActiveProbePath::GrePrimary;
+                    self.send_gre_in_gre(seq, tok);
+                }
+            }
+        }
+    }
+
+    fn send_fallback_probes(&mut self, seq: u16, tok: u32, ka_udp_port: u16) {
+        if self.probe_path != ActiveProbePath::GrePrimary {
+            self.send_gre_in_gre(seq, tok);
+        }
+        let mut sent_echo = false;
+        if self.probe_path != ActiveProbePath::InTunnelEcho {
+            sent_echo = self.send_in_tunnel_echo(seq, tok);
+        }
+        if self.probe_path != ActiveProbePath::InTunnelTtl1
+            && (!sent_echo || self.keepalive.misses() >= 1)
+        {
+            let _ = self.send_in_tunnel_ttl1(tok);
+        }
+        if self.probe_path != ActiveProbePath::UdpBounce
+            && (!self.has_in_tunnel_addr() || self.keepalive.misses() >= 1)
+        {
+            let _ = self.send_udp_bounce(seq, tok, ka_udp_port);
         }
     }
 
@@ -433,6 +929,45 @@ impl ManagedTunnel {
     }
 }
 
+fn drain_ka_udp_replies(sock: &UdpSocket, tunnels: &[ManagedTunnel]) {
+    let mut buf = [0u8; 64];
+    for _ in 0..64 {
+        let (n, peer_addr) = match sock.recv_from(&mut buf) {
+            Ok(v) => v,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        let SocketAddr::V4(peer_v4) = peer_addr else {
+            continue;
+        };
+        let Some((tag, tok)) = parse_udp_keepalive_payload(&buf[..n]) else {
+            continue;
+        };
+        let sender_ip = *peer_v4.ip();
+        let Some(tunnel) = tunnels
+            .iter()
+            .find(|t| t.shared.ka_daemon_tag == tag && t.remote_ip() == sender_ip)
+        else {
+            continue;
+        };
+        match tunnel.shared.check_ka_reply(
+            KeepaliveReplyKind::UdpBounce,
+            Some(tag),
+            Some(tok),
+            4,
+            0,
+        ) {
+            KaReplyOutcome::Accepted => {
+                tunnel.shared.ka_replies_rx.fetch_add(1, Ordering::Release);
+            }
+            KaReplyOutcome::DuplicateCurrent => {}
+            KaReplyOutcome::Rejected => {
+                tunnel.shared.ka_spoof_drops.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
 pub fn run_daemon(config: AppConfig) -> Result<(), String> {
     install_signal_handlers();
     let daemon_epoch = Instant::now();
@@ -446,6 +981,20 @@ pub fn run_daemon(config: AppConfig) -> Result<(), String> {
     };
     cleanup_stale_easygre_routes(&instance_lease, legacy_status_orphan);
     let bypass_registry = BypassRegistry::new(instance_lease.bypass_metric());
+
+    let any_nat = config
+        .tunnels
+        .iter()
+        .any(|t| t.nat != NatMode::Off || !t.dnat_rules.is_empty());
+    if any_nat {
+        let want_v6_fwd = config.tunnels.iter().any(|t| {
+            t.nat.has_exit()
+                || t.addresses.iter().any(|c| matches!(c, IpCidr::V6 { .. }))
+                || t.routes.iter().any(|r| matches!(r.dst, IpCidr::V6 { .. }))
+                || t.dnat_rules.iter().any(|d| d.target.is_ipv6())
+        });
+        enable_ip_forwarding(true, want_v6_fwd);
+    }
 
     let has_routes = config.tunnels.iter().any(|t| !t.routes.is_empty());
     let fast_path_any = config.tx_mode != TxMode::Raw
@@ -465,6 +1014,19 @@ pub fn run_daemon(config: AppConfig) -> Result<(), String> {
     if let Some(ref nw) = neigh_watch {
         let _ = ctrl_epoll.add(nw.raw_fd(), TOKEN_NETLINK_NEIGH);
     }
+    let ka_udp_sock = UdpSocket::bind("0.0.0.0:0")
+        .ok()
+        .and_then(|s| s.set_nonblocking(true).ok().map(|()| s));
+    let ka_udp_port = ka_udp_sock
+        .as_ref()
+        .and_then(|s| s.local_addr().ok())
+        .map(|a| a.port())
+        .unwrap_or(0);
+    #[cfg(target_os = "linux")]
+    if let Some(ref us) = ka_udp_sock {
+        use std::os::fd::AsRawFd;
+        let _ = ctrl_epoll.add(us.as_raw_fd(), TOKEN_KA_UDP);
+    }
 
     let now = daemon_epoch;
     let all_configured_routes: Vec<RouteSpec> = config
@@ -473,12 +1035,17 @@ pub fn run_daemon(config: AppConfig) -> Result<(), String> {
         .flat_map(|t| t.routes.iter().cloned())
         .collect();
     let mut tunnels: Vec<ManagedTunnel> = Vec::with_capacity(config.tunnels.len());
+    let mut nat_relays: Vec<(Arc<TunnelShared>, Arc<TunnelNatEngine>, NatRelayListeners, RawGreSocket)> =
+        Vec::new();
     let mut resolved_pairs: Vec<(Ipv4Addr, Ipv4Addr, String)> = Vec::new();
+    let lease_slot = instance_lease.slot();
 
-    for cfg in config.tunnels.into_iter() {
+    for (tun_idx, cfg) in config.tunnels.into_iter().enumerate() {
         let existing_tun_ifs: Vec<u32> = tunnels.iter().map(|t| t.shared.tun.ifindex()).collect();
-        let tunnel = setup_tunnel(
+        let (tunnel, nat_relay_opt) = setup_tunnel(
             cfg,
+            lease_slot,
+            tun_idx,
             requested_queues,
             tx_mode,
             &existing_tun_ifs,
@@ -498,6 +1065,9 @@ pub fn run_daemon(config: AppConfig) -> Result<(), String> {
             ));
         }
         resolved_pairs.push((r_ip, l_ip, tunnel.cfg.name.clone()));
+        if let Some((nat_eng, listeners, nat_tx_sock)) = nat_relay_opt {
+            nat_relays.push((Arc::clone(&tunnel.shared), nat_eng, listeners, nat_tx_sock));
+        }
         tunnels.push(tunnel);
     }
 
@@ -548,6 +1118,47 @@ pub fn run_daemon(config: AppConfig) -> Result<(), String> {
         worker_handles.push(handle);
     }
 
+    for (sh, nat_eng, listeners, nat_tx_sock) in nat_relays {
+        let wname = format!("nat-{}", sh.name);
+        let health = WorkerHealth::new(wname.clone(), daemon_epoch);
+        worker_healths.push(Arc::clone(&health));
+        let stop = Arc::clone(&stop_flag);
+        let wake = Arc::clone(&wake_evt);
+        let tun_ifname = sh.name.clone();
+        let dscp = sh.dscp_mode;
+        let handle = thread::Builder::new()
+            .name(wname.clone())
+            .spawn(move || {
+                let _guard = WorkerExitGuard {
+                    health: Arc::clone(&health),
+                    stop_flag: Arc::clone(&stop),
+                    wake_evt: wake,
+                };
+                let sh_rem = Arc::clone(&sh);
+                let sh_car = Arc::clone(&sh);
+                let sh_cnt = Arc::clone(&sh);
+                run_nat_relay_worker(
+                    nat_eng,
+                    listeners,
+                    tun_ifname,
+                    nat_tx_sock,
+                    dscp,
+                    move || Ipv4Addr::from(sh_rem.remote_ip.load(Ordering::Acquire)),
+                    move || sh_car.carrier_up.load(Ordering::Acquire),
+                    move || {
+                        sh_cnt.tx_packets.fetch_add(1, Ordering::Relaxed);
+                    },
+                    stop,
+                    move || health.beat(),
+                );
+            })
+            .map_err(|e| {
+                stop_flag.store(true, Ordering::Release);
+                format!("failed to spawn NAT worker '{wname}': {e}")
+            })?;
+        worker_handles.push(handle);
+    }
+
     {
         let rx_shared = shared_list.clone();
         let rx_stop = Arc::clone(&stop_flag);
@@ -584,8 +1195,15 @@ pub fn run_daemon(config: AppConfig) -> Result<(), String> {
     flush_status(&config.status_file, pid, true, &tunnels);
     let mut last_status_flush = Instant::now();
 
-    let mut status_dirty =
-        process_control_tick(&mut tunnels, tx_mode, &wake_evt, &bypass_registry, false, Instant::now());
+    let mut status_dirty = process_control_tick(
+        &mut tunnels,
+        tx_mode,
+        ka_udp_port,
+        &wake_evt,
+        &bypass_registry,
+        false,
+        Instant::now(),
+    );
     if status_dirty {
         flush_status(&config.status_file, pid, true, &tunnels);
         last_status_flush = Instant::now();
@@ -606,6 +1224,10 @@ pub fn run_daemon(config: AppConfig) -> Result<(), String> {
                     } else if tok == TOKEN_NETLINK_NEIGH {
                         if let Some(ref nw) = neigh_watch {
                             neigh_event |= nw.drain();
+                        }
+                    } else if tok == TOKEN_KA_UDP {
+                        if let Some(ref us) = ka_udp_sock {
+                            drain_ka_udp_replies(us, &tunnels);
                         }
                     }
                 }
@@ -629,8 +1251,15 @@ pub fn run_daemon(config: AppConfig) -> Result<(), String> {
         }
 
         let now = Instant::now();
-        status_dirty |=
-            process_control_tick(&mut tunnels, tx_mode, &wake_evt, &bypass_registry, neigh_event, now);
+        status_dirty |= process_control_tick(
+            &mut tunnels,
+            tx_mode,
+            ka_udp_port,
+            &wake_evt,
+            &bypass_registry,
+            neigh_event,
+            now,
+        );
 
         if status_dirty || now.duration_since(last_status_flush) >= STATUS_FLUSH_INTERVAL {
             flush_status(&config.status_file, pid, true, &tunnels);
@@ -673,15 +1302,20 @@ fn find_unhealthy_worker(workers: &[Arc<WorkerHealth>], now_ms: u64) -> Option<S
     None
 }
 
+type SetupNatRelay = Option<(Arc<TunnelNatEngine>, NatRelayListeners, RawGreSocket)>;
+
+#[allow(clippy::too_many_arguments)]
 fn setup_tunnel(
     cfg: TunnelConfig,
+    lease_slot: u32,
+    tunnel_idx: usize,
     requested_queues: usize,
     tx_mode: TxMode,
     existing_tun_ifs: &[u32],
     all_routes: &[RouteSpec],
     bypass_registry: &Arc<BypassRegistry>,
     now: Instant,
-) -> Result<ManagedTunnel, String> {
+) -> Result<(ManagedTunnel, SetupNatRelay), String> {
     let remote_ip = cfg.remote.resolve_ipv4()?;
     let probe = probe_route_excluding(remote_ip, cfg.local_address, existing_tun_ifs)?;
     let actual_mtu = match cfg.mtu {
@@ -728,6 +1362,26 @@ fn setup_tunnel(
         installed_routes.0.append(&mut added);
     }
 
+    let (nat_engine, nat_listeners) = TunnelNatEngine::setup(
+        now,
+        lease_slot,
+        tunnel_idx,
+        tun.ifindex(),
+        cfg.nat,
+        &cfg.dnat_rules,
+        &cfg.addresses,
+        &cfg.routes,
+        &probe.out_ifname,
+        configure_interface_addr,
+    )?;
+    let nat_relay_init = match (&nat_engine, nat_listeners) {
+        (Some(eng), Some(listeners)) => {
+            let nat_tx_sock = RawGreSocket::open_tx(cfg.local_address)?;
+            Some((Arc::clone(eng), listeners, nat_tx_sock))
+        }
+        _ => None,
+    };
+
     let use_fast_path = tx_mode != TxMode::Raw && cfg.allow_fast_path;
     let src_mac = if use_fast_path && probe.out_ifindex > 0 {
         get_interface_hwaddr(&probe.out_ifname).ok()
@@ -758,7 +1412,7 @@ fn setup_tunnel(
 
     let keepalive = KeepaliveStateMachine::new(cfg.keepalive, now);
     eprintln!(
-        "[info] [{}] initialized: local={} remote={} ({}) mtu={} (out_dev={} out_mtu={}) keepalive={} dscp={:?} df={:?} clamp_mss={} vnet_tso={} udp_gso={} queues={} mq={}",
+        "[info] [{}] initialized: local={} remote={} ({}) mtu={} (out_dev={} out_mtu={}) keepalive={} nat={} dnat_rules={} dscp={:?} df={:?} clamp_mss={} vnet_tso={} udp_gso={} queues={} mq={}",
         cfg.name,
         probe.local_ip,
         cfg.remote.as_display(),
@@ -767,6 +1421,8 @@ fn setup_tunnel(
         probe.out_ifname,
         probe.out_mtu,
         keepalive.state().as_str(),
+        cfg.nat.as_str(),
+        cfg.dnat_rules.len(),
         cfg.dscp,
         cfg.dont_fragment,
         cfg.clamp_tcp_mss,
@@ -784,6 +1440,27 @@ fn setup_tunnel(
         }
     }
 
+    let (tun_v4_local, tun_v4_peer_static) = derive_tunnel_v4_endpoints(&cfg);
+    let (tun_v6_local, tun_v6_peer_static) = derive_tunnel_v6_endpoints(&cfg);
+    let local_v4_addrs: Vec<Ipv4Addr> = cfg
+        .addresses
+        .iter()
+        .filter_map(|c| match *c {
+            IpCidr::V4 { addr, .. } => Some(addr),
+            IpCidr::V6 { .. } => None,
+        })
+        .collect();
+    let local_v6_addrs: Vec<Ipv6Addr> = cfg
+        .addresses
+        .iter()
+        .filter_map(|c| match *c {
+            IpCidr::V6 { addr, .. } => Some(addr),
+            IpCidr::V4 { .. } => None,
+        })
+        .collect();
+    let raw_tag = random_u64() as u32;
+    let ka_daemon_tag = if raw_tag == 0 { 0x4547_5245 } else { raw_tag };
+
     let shared = Arc::new(TunnelShared {
         name: cfg.name.clone(),
         epoch: now,
@@ -794,6 +1471,15 @@ fn setup_tunnel(
         clamp_tcp_mss: cfg.clamp_tcp_mss,
         allow_fast_path: cfg.allow_fast_path,
         actual_mtu,
+        ka_daemon_tag,
+        local_v4_addrs,
+        local_v6_addrs,
+        tun_v4_local,
+        tun_v4_peer_static,
+        tun_v4_peer_learned: AtomicU32::new(0),
+        tun_v6_local,
+        tun_v6_peer_static,
+        tun_v6_peer_learned: Mutex::new(None),
         out_mtu: AtomicU32::new(probe.out_mtu as u32),
         out_ifindex: AtomicU32::new(probe.out_ifindex),
         src_mac: AtomicU64::new(src_mac_packed),
@@ -819,6 +1505,9 @@ fn setup_tunnel(
             AtomicU32::new(0),
             AtomicU32::new(0),
         ],
+        ka_current_tok: AtomicU32::new(0),
+        ka_last_accepted_tok: AtomicU32::new(0),
+        ka_last_reply_kind: AtomicU32::new(KeepaliveReplyKind::GrePt0 as u32),
         tx_packets: AtomicU64::new(0),
         rx_packets: AtomicU64::new(0),
         tx_drops: AtomicU64::new(0),
@@ -828,26 +1517,34 @@ fn setup_tunnel(
         ka_requests_ans: AtomicU64::new(0),
         ka_spoof_drops: AtomicU64::new(0),
         emsgsize_warned: AtomicBool::new(false),
+        nat: nat_engine,
         tun,
     });
 
-    Ok(ManagedTunnel {
-        cfg,
-        shared,
-        ka_tx_sock,
-        keepalive,
-        last_ka_replies_seen: 0,
-        last_learned_public: 0,
-        out_ifname: probe.out_ifname,
-        gateway: probe.gateway,
-        next_dns_check,
-        dns_inflight: false,
-        dns_result: Arc::new(Mutex::new(None)),
-        next_arp_check,
-        arp_logged_fastpath,
-        bypass_route,
-        _installed_routes: installed_routes,
-    })
+    Ok((
+        ManagedTunnel {
+            cfg,
+            shared,
+            ka_tx_sock,
+            keepalive,
+            probe_path: ActiveProbePath::GrePrimary,
+            logged_probe_path: ActiveProbePath::GrePrimary,
+            current_probe: None,
+            fallback_due_at: None,
+            last_ka_replies_seen: 0,
+            last_learned_public: 0,
+            out_ifname: probe.out_ifname,
+            gateway: probe.gateway,
+            next_dns_check,
+            dns_inflight: false,
+            dns_result: Arc::new(Mutex::new(None)),
+            next_arp_check,
+            arp_logged_fastpath,
+            bypass_route,
+            _installed_routes: installed_routes,
+        },
+        nat_relay_init,
+    ))
 }
 
 fn find_tunnel_idx(tunnels: &[Arc<TunnelShared>], outer_src: Ipv4Addr, outer_dst: Ipv4Addr) -> Option<usize> {
@@ -968,6 +1665,7 @@ fn run_rx_worker(
                     protocol,
                     ka_req_tok,
                     is_ka_req,
+                    is_in_tun_ka_req,
                     learned_ip,
                     ka_rep_info,
                 ) = {
@@ -985,8 +1683,11 @@ fn run_rx_worker(
                     };
                     match decoded {
                         GreDecoded::KeepaliveReply {
+                            kind,
+                            daemon_tag,
                             echo_token,
                             body_len,
+                            peer_tunnel_ip,
                         } => (
                             outer.src,
                             outer.dst,
@@ -996,8 +1697,9 @@ fn run_rx_worker(
                             0u16,
                             None,
                             false,
+                            false,
                             Ipv4Addr::UNSPECIFIED,
-                            Some((echo_token, body_len)),
+                            Some((kind, daemon_tag, echo_token, body_len, peer_tunnel_ip)),
                         ),
                         GreDecoded::KeepaliveRequest {
                             learned_public_ip,
@@ -1012,9 +1714,26 @@ fn run_rx_worker(
                             0u16,
                             echo_token,
                             true,
+                            false,
                             learned_public_ip,
                             None,
                         ),
+                        GreDecoded::InTunnelKeepaliveRequest { protocol, payload } => {
+                            let start = payload.as_ptr() as usize - pkt_slice.as_ptr() as usize;
+                            (
+                                outer.src,
+                                outer.dst,
+                                outer.id,
+                                start,
+                                start + payload.len(),
+                                protocol,
+                                None,
+                                false,
+                                true,
+                                Ipv4Addr::UNSPECIFIED,
+                                None,
+                            )
+                        }
                         GreDecoded::Data { protocol, payload } => {
                             let start = payload.as_ptr() as usize - pkt_slice.as_ptr() as usize;
                             (
@@ -1025,6 +1744,7 @@ fn run_rx_worker(
                                 start + payload.len(),
                                 protocol,
                                 None,
+                                false,
                                 false,
                                 Ipv4Addr::UNSPECIFIED,
                                 None,
@@ -1039,14 +1759,21 @@ fn run_rx_worker(
                 };
                 let tunnel = &tunnels[idx];
 
-                if let Some((rep_tok, body_len)) = ka_rep_info {
-                    if tunnel.verify_ka_reply(rep_tok, body_len, outer_id) {
-                        tunnel.ka_replies_rx.fetch_add(1, Ordering::Release);
-                        if !tunnel.carrier_up.load(Ordering::Relaxed) {
-                            wake_evt.notify();
+                if let Some((rep_kind, rep_tag, rep_tok, body_len, peer_tun_ip)) = ka_rep_info {
+                    match tunnel.check_ka_reply(rep_kind, rep_tag, rep_tok, body_len, outer_id) {
+                        KaReplyOutcome::Accepted => {
+                            if let Some(pt) = peer_tun_ip {
+                                tunnel.observe_peer_tunnel_ip(pt);
+                            }
+                            tunnel.ka_replies_rx.fetch_add(1, Ordering::Release);
+                            if !tunnel.carrier_up.load(Ordering::Relaxed) {
+                                wake_evt.notify();
+                            }
                         }
-                    } else {
-                        tunnel.ka_spoof_drops.fetch_add(1, Ordering::Relaxed);
+                        KaReplyOutcome::DuplicateCurrent => {}
+                        KaReplyOutcome::Rejected => {
+                            tunnel.ka_spoof_drops.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                     continue;
                 }
@@ -1065,6 +1792,37 @@ fn run_rx_worker(
                     tunnel.rx_drops.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
+
+                if is_in_tun_ka_req && tunnel.owns_in_tunnel_dst(protocol, &pkt_slice[p_start..p_end])
+                {
+                    let mut rep_buf = [0u8; 64];
+                    if let Some(rep_len) = build_in_tunnel_keepalive_reply(
+                        protocol,
+                        &pkt_slice[p_start..p_end],
+                        &mut rep_buf,
+                    ) {
+                        tunnel.ka_requests_ans.fetch_add(1, Ordering::Relaxed);
+                        let _ =
+                            ka_reply_socks[idx].send_to(outer_src, 0, false, &rep_buf[..rep_len]);
+                        continue;
+                    }
+                }
+
+                if protocol == ETHERTYPE_IPV4 {
+                    if let Some(outcome) =
+                        tunnel.try_consume_truncated_ttl1_reply(&pkt_slice[p_start..p_end])
+                    {
+                        if matches!(outcome, KaReplyOutcome::Accepted) {
+                            tunnel.ka_replies_rx.fetch_add(1, Ordering::Release);
+                            if !tunnel.carrier_up.load(Ordering::Relaxed) {
+                                wake_evt.notify();
+                            }
+                        }
+                        continue;
+                    }
+                }
+
+                tunnel.maybe_learn_peer_from_data(protocol, &pkt_slice[p_start..p_end]);
                 let Some(meta) = inspect_inner_ip(&pkt_slice[p_start..p_end]) else {
                     tunnel.rx_drops.fetch_add(1, Ordering::Relaxed);
                     continue;
@@ -1073,6 +1831,14 @@ fn run_rx_worker(
                     (ETHERTYPE_IPV4, IpVersion::V4) | (ETHERTYPE_IPV6, IpVersion::V6) => {}
                     _ => {
                         tunnel.rx_drops.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                }
+                if let Some(ref nat) = tunnel.nat {
+                    if nat.process_inbound(&mut pkt_slice[p_start..p_end])
+                        == InboundNatOutcome::Consumed
+                    {
+                        tunnel.rx_packets.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
                 }
@@ -1502,6 +2268,12 @@ fn try_commit_vnet_frame_in_place(
     if !finish_partial_checksum(&mut frame[WIRE_PKT_OFF..wire_end], vhdr) {
         return None;
     }
+    frame[VNET_IN_FRAME_OFF] &= !0x01;
+    if let Some(ref nat) = shared.nat {
+        if !nat.process_outbound(&mut frame[WIRE_PKT_OFF..wire_end], false) {
+            return None;
+        }
+    }
     if shared.clamp_tcp_mss {
         clamp_tcp_mss(&mut frame[WIRE_PKT_OFF..wire_end], shared.actual_mtu);
     }
@@ -1574,6 +2346,11 @@ fn process_vnet_staged_packet(
             shared.tx_drops.fetch_add(1, Ordering::Relaxed);
             return 0;
         }
+        if let Some(ref nat) = shared.nat {
+            if !nat.process_outbound(&mut buf[pkt_start..pkt_end], false) {
+                return n - VNET_HDR_LEN;
+            }
+        }
         if shared.clamp_tcp_mss {
             clamp_tcp_mss(&mut buf[pkt_start..pkt_end], shared.actual_mtu);
         }
@@ -1585,8 +2362,15 @@ fn process_vnet_staged_packet(
         buf[VNET_HDR_LEN + 1] = 0;
         buf[VNET_HDR_LEN + 2..VNET_HDR_LEN + 4].copy_from_slice(&proto.to_be_bytes());
         sink.push_ready_slice(&buf[VNET_HDR_LEN..pkt_end]);
-    } else if !segment_tso_into(&buf[pkt_start..pkt_end], vhdr, shared.actual_mtu, sink) {
-        shared.tx_drops.fetch_add(1, Ordering::Relaxed);
+    } else {
+        if let Some(ref nat) = shared.nat {
+            if !nat.process_outbound(&mut buf[pkt_start..pkt_end], true) {
+                return n - VNET_HDR_LEN;
+            }
+        }
+        if !segment_tso_into(&buf[pkt_start..pkt_end], vhdr, shared.actual_mtu, sink) {
+            shared.tx_drops.fetch_add(1, Ordering::Relaxed);
+        }
     }
     n - VNET_HDR_LEN
 }
@@ -2052,6 +2836,11 @@ fn run_tx_worker(
                     shared.tx_drops.fetch_add(1, Ordering::Relaxed);
                     continue;
                 };
+                if let Some(ref nat) = shared.nat {
+                    if !nat.process_outbound(&mut tun_read_buf[4..pkt_end], false) {
+                        continue;
+                    }
+                }
                 if shared.clamp_tcp_mss {
                     clamp_tcp_mss(&mut tun_read_buf[4..pkt_end], shared.actual_mtu);
                 }
@@ -2113,6 +2902,7 @@ fn refresh_tunnel_arp(tunnel: &mut ManagedTunnel, now: Instant, immediate_on_nei
 fn process_control_tick(
     tunnels: &mut [ManagedTunnel],
     tx_mode: TxMode,
+    ka_udp_port: u16,
     wake_evt: &Arc<EventFd>,
     bypass_registry: &Arc<BypassRegistry>,
     neigh_event: bool,
@@ -2130,17 +2920,30 @@ fn process_control_tick(
         if cur_replies > tunnel.last_ka_replies_seen {
             let delta = cur_replies - tunnel.last_ka_replies_seen;
             tunnel.last_ka_replies_seen = cur_replies;
+            tunnel.fallback_due_at = None;
+            let new_path = ActiveProbePath::from_reply_kind(tunnel.shared.last_reply_kind());
+            tunnel.probe_path = new_path;
             for _ in 0..delta.min(4) {
                 if let Some(true) = tunnel.keepalive.on_reply() {
                     tunnel.shared.carrier_up.store(true, Ordering::Release);
                     let _ = tunnel.shared.tun.set_carrier(true);
                     changed = true;
                     eprintln!(
-                        "[info] [{}] keepalive UP (carrier ON, peer={})",
+                        "[info] [{}] keepalive UP (carrier ON, peer={}, mode={})",
                         tunnel.cfg.name,
-                        tunnel.remote_ip()
+                        tunnel.remote_ip(),
+                        new_path.as_str()
                     );
+                    tunnel.logged_probe_path = new_path;
                 }
+            }
+            if tunnel.logged_probe_path != new_path && tunnel.keepalive.is_carrier_up() {
+                tunnel.logged_probe_path = new_path;
+                eprintln!(
+                    "[info] [{}] keepalive probe mode switched to {}",
+                    tunnel.cfg.name,
+                    new_path.as_str()
+                );
             }
         }
 
@@ -2229,10 +3032,15 @@ fn process_control_tick(
                                     .store(new_src_mac, Ordering::Release);
                                 tunnel.shared.next_hop_mac.store(0, Ordering::Release);
                                 tunnel.out_ifname = probe.out_ifname;
+                                if let Some(ref nat) = tunnel.shared.nat {
+                                    nat.update_out_ifname(&tunnel.out_ifname);
+                                }
                                 tunnel.gateway = probe.gateway;
                                 // Drop old bypass route only AFTER new bypass route and new peer state are live
                                 tunnel.bypass_route = new_bypass;
                                 tunnel.next_arp_check = Some(now);
+                                tunnel.probe_path = ActiveProbePath::GrePrimary;
+                                tunnel.fallback_due_at = None;
                                 tunnel.keepalive.schedule_immediate_probe(now);
                                 changed = true;
                                 eprintln!(
@@ -2316,11 +3124,19 @@ fn process_control_tick(
         }
         if ka_poll.should_send {
             let (seq, tok) = tunnel.keepalive.next_probe_ids();
-            let remote_ip = tunnel.remote_ip();
+            tunnel.current_probe = Some((seq, tok));
             tunnel.shared.record_expected_ka(seq, tok);
-            let probe_pkt =
-                build_keepalive_request_with_token(remote_ip, tunnel.effective_reply_dst_ip(), seq, tok);
-            let _ = tunnel.ka_tx_sock.send_to(remote_ip, 0, false, &probe_pkt);
+            tunnel.send_primary_probe(seq, tok, ka_udp_port);
+            tunnel.fallback_due_at = now.checked_add(tunnel.fallback_delay());
+        } else if let Some(due_fb) = tunnel.fallback_due_at {
+            if now >= due_fb {
+                tunnel.fallback_due_at = None;
+                if tunnel.shared.ka_awaiting.load(Ordering::Acquire) {
+                    if let Some((seq, tok)) = tunnel.current_probe {
+                        tunnel.send_fallback_probes(seq, tok, ka_udp_port);
+                    }
+                }
+            }
         }
     }
     changed
@@ -2332,6 +3148,11 @@ fn next_timeout_ms(tunnels: &[ManagedTunnel], last_status_flush: Instant, now: I
         .unwrap_or(now);
     for t in tunnels {
         if let Some(due) = t.keepalive.next_probe_at() {
+            if due < earliest {
+                earliest = due;
+            }
+        }
+        if let Some(due) = t.fallback_due_at {
             if due < earliest {
                 earliest = due;
             }
@@ -2386,6 +3207,15 @@ mod tests {
             clamp_tcp_mss: true,
             allow_fast_path: true,
             actual_mtu: 1476,
+            ka_daemon_tag: 0x4547_5245,
+            local_v4_addrs: vec![Ipv4Addr::new(172, 16, 0, 2)],
+            local_v6_addrs: Vec::new(),
+            tun_v4_local: Some((Ipv4Addr::new(172, 16, 0, 2), 24)),
+            tun_v4_peer_static: None,
+            tun_v4_peer_learned: AtomicU32::new(0),
+            tun_v6_local: None,
+            tun_v6_peer_static: None,
+            tun_v6_peer_learned: Mutex::new(None),
             out_mtu: AtomicU32::new(1500),
             out_ifindex: AtomicU32::new(2),
             src_mac: AtomicU64::new(0),
@@ -2411,6 +3241,9 @@ mod tests {
                 AtomicU32::new(0),
                 AtomicU32::new(0),
             ],
+            ka_current_tok: AtomicU32::new(0),
+            ka_last_accepted_tok: AtomicU32::new(0),
+            ka_last_reply_kind: AtomicU32::new(KeepaliveReplyKind::GrePt0 as u32),
             tx_packets: AtomicU64::new(0),
             rx_packets: AtomicU64::new(0),
             tx_drops: AtomicU64::new(0),
@@ -2420,6 +3253,7 @@ mod tests {
             ka_requests_ans: AtomicU64::new(0),
             ka_spoof_drops: AtomicU64::new(0),
             emsgsize_warned: AtomicBool::new(false),
+            nat: None,
             tun: TunDevice::dummy_for_test(),
         };
 

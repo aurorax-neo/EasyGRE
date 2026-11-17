@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashSet};
 use std::env;
-use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 
 use crate::keepalive::KeepaliveConfig;
@@ -34,6 +34,58 @@ pub enum DscpMode {
 pub enum DontFragmentMode {
     No,
     Inherit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NatMode {
+    Off,
+    Out,
+    Exit,
+    Both,
+}
+
+impl NatMode {
+    pub fn has_out(self) -> bool {
+        matches!(self, Self::Out | Self::Both)
+    }
+
+    pub fn has_exit(self) -> bool {
+        matches!(self, Self::Exit | Self::Both)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Out => "out",
+            Self::Exit => "exit",
+            Self::Both => "both",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DnatProto {
+    Tcp,
+    Udp,
+    Both,
+}
+
+impl DnatProto {
+    pub fn includes_tcp(self) -> bool {
+        matches!(self, Self::Tcp | Self::Both)
+    }
+
+    pub fn includes_udp(self) -> bool {
+        matches!(self, Self::Udp | Self::Both)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnatRule {
+    pub proto: DnatProto,
+    pub listen_ip: Option<IpAddr>,
+    pub listen_port: u16,
+    pub target: SocketAddr,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +203,8 @@ pub struct TunnelConfig {
     pub dont_fragment: DontFragmentMode,
     pub clamp_tcp_mss: bool,
     pub allow_fast_path: bool,
+    pub nat: NatMode,
+    pub dnat_rules: Vec<DnatRule>,
     pub addresses: Vec<IpCidr>,
     pub routes: Vec<RouteSpec>,
     pub dns_refresh: Duration,
@@ -174,6 +228,8 @@ impl Default for TunnelConfig {
             dont_fragment: DontFragmentMode::No,
             clamp_tcp_mss: true,
             allow_fast_path: true,
+            nat: NatMode::Off,
+            dnat_rules: Vec::new(),
             addresses: Vec::new(),
             routes: Vec::new(),
             dns_refresh: Duration::from_secs(60),
@@ -254,7 +310,12 @@ pub fn parse_cli_and_env(args: &[String], env_vars: &BTreeMap<String, String>) -
                     } else if k == "tunnel" {
                         cli_tunnels.push(v.to_string());
                     } else {
-                        single_cli_fields.insert(k.to_string(), v.to_string());
+                        let nk = normalize_key(k);
+                        if matches!(nk.as_str(), "addr" | "route" | "dnat") {
+                            append_csv_field(&mut single_cli_fields, &nk, v);
+                        } else {
+                            single_cli_fields.insert(nk, v.to_string());
+                        }
                     }
                 } else {
                     let key = &arg[2..];
@@ -262,12 +323,19 @@ pub fn parse_cli_and_env(args: &[String], env_vars: &BTreeMap<String, String>) -
                         single_cli_fields.insert("clamp-tcp-mss".into(), "false".into());
                     } else if matches!(key, "no-allow-fast-path") {
                         single_cli_fields.insert("allow-fast-path".into(), "false".into());
+                    } else if matches!(key, "no-nat") {
+                        single_cli_fields.insert("nat".into(), "off".into());
                     } else if matches!(key, "disabled") {
                         single_cli_fields.insert("enabled".into(), "false".into());
                     } else {
                         idx += 1;
                         let val = take_val(args, idx, arg)?;
-                        single_cli_fields.insert(key.to_string(), val);
+                        let nk = normalize_key(key);
+                        if matches!(nk.as_str(), "addr" | "route" | "dnat") {
+                            append_csv_field(&mut single_cli_fields, &nk, &val);
+                        } else {
+                            single_cli_fields.insert(nk, val);
+                        }
                     }
                 }
             }
@@ -306,6 +374,17 @@ fn take_val(args: &[String], idx: usize, flag: &str) -> Result<String, String> {
     args.get(idx)
         .cloned()
         .ok_or_else(|| format!("missing value for {flag}"))
+}
+
+fn append_csv_field(map: &mut BTreeMap<String, String>, key: &str, val: &str) {
+    if let Some(existing) = map.get_mut(key) {
+        if !existing.is_empty() && !val.trim().is_empty() {
+            existing.push(',');
+        }
+        existing.push_str(val.trim());
+    } else {
+        map.insert(key.to_string(), val.trim().to_string());
+    }
 }
 
 fn resolve_tunnels(
@@ -360,6 +439,7 @@ fn resolve_tunnels(
 
     let mut names = HashSet::new();
     let mut endpoints = HashSet::new();
+    let mut dnat_binds: HashSet<(u8, Option<IpAddr>, u16)> = HashSet::new();
     for t in &enabled_tunnels {
         if !names.insert(t.name.clone()) {
             return Err(format!("duplicate tunnel interface name '{}'", t.name));
@@ -372,6 +452,24 @@ fn resolve_tunnels(
                 t.local_address,
                 t.name
             ));
+        }
+        for rule in &t.dnat_rules {
+            if rule.proto.includes_tcp()
+                && !dnat_binds.insert((6, rule.listen_ip, rule.listen_port))
+            {
+                return Err(format!(
+                    "duplicate TCP DNAT listen port {} on '{}'",
+                    rule.listen_port, t.name
+                ));
+            }
+            if rule.proto.includes_udp()
+                && !dnat_binds.insert((17, rule.listen_ip, rule.listen_port))
+            {
+                return Err(format!(
+                    "duplicate UDP DNAT listen port {} on '{}'",
+                    rule.listen_port, t.name
+                ));
+            }
         }
     }
     Ok(enabled_tunnels)
@@ -429,13 +527,24 @@ fn parse_tunnel_spec(spec: &str) -> Result<BTreeMap<String, String>, String> {
         let (k, v) = trimmed
             .split_once('=')
             .ok_or_else(|| format!("invalid tunnel option '{trimmed}', expected key=value"))?;
-        map.insert(normalize_key(k), v.trim().to_string());
+        let nk = normalize_key(k);
+        if matches!(nk.as_str(), "addr" | "route" | "dnat") {
+            append_csv_field(&mut map, &nk, v);
+        } else {
+            map.insert(nk, v.trim().to_string());
+        }
     }
     Ok(map)
 }
 
 fn normalize_key(k: &str) -> String {
-    k.trim().to_ascii_lowercase().replace('_', "-")
+    let norm = k.trim().to_ascii_lowercase().replace('_', "-");
+    match norm.as_str() {
+        "address" | "addresses" => "addr".into(),
+        "routes" => "route".into(),
+        "port-forward" => "dnat".into(),
+        _ => norm,
+    }
 }
 
 fn build_tunnel_from_map(
@@ -501,6 +610,18 @@ fn build_tunnel_from_map(
             "dont-fragment" | "df" => cfg.dont_fragment = parse_dont_fragment(v)?,
             "clamp-tcp-mss" => cfg.clamp_tcp_mss = parse_bool(v, "clamp-tcp-mss")?,
             "allow-fast-path" => cfg.allow_fast_path = parse_bool(v, "allow-fast-path")?,
+            "nat" => cfg.nat = parse_nat_mode(v)?,
+            "dnat" | "port-forward" => {
+                for part in v.split(',') {
+                    let p = part.trim();
+                    if !p.is_empty() {
+                        let rule = parse_dnat_rule(p)?;
+                        if !cfg.dnat_rules.contains(&rule) {
+                            cfg.dnat_rules.push(rule);
+                        }
+                    }
+                }
+            }
             "addr" | "address" | "addresses" => {
                 for part in v.split(',') {
                     let p = part.trim();
@@ -554,6 +675,13 @@ fn build_tunnel_from_map(
             )
         })?;
         cfg.remote = RemoteEndpoint::parse(&raw)?;
+        if cfg.nat.has_out() && cfg.addresses.is_empty() {
+            return Err(format!(
+                "tunnel '{}' has outbound NAT enabled (--nat {}) which requires at least one tunnel address (--addr / GRE_ADDR); use --nat exit if only exit WAN masquerade is needed",
+                cfg.name,
+                cfg.nat.as_str()
+            ));
+        }
     } else if let Some(raw) = remote_raw {
         cfg.remote = RemoteEndpoint::parse(&raw)?;
     }
@@ -611,6 +739,103 @@ pub fn parse_dont_fragment(raw: &str) -> Result<DontFragmentMode, String> {
         ),
         _ => Err(format!("invalid dont-fragment '{raw}', expected 'no' or 'inherit'")),
     }
+}
+
+/// Parse built-in pure user-space NAT mode:
+/// - `off` | `false` | `no` | `none` | `0`
+/// - `out` | `outbound` | `snat` | `tunnel`
+/// - `exit` | `in` | `inbound` | `wan` | `masquerade`
+/// - `both` | `all` | `true` | `on` | `yes` | `1` | `out+exit`
+pub fn parse_nat_mode(raw: &str) -> Result<NatMode, String> {
+    let t = raw.trim().to_ascii_lowercase();
+    match t.as_str() {
+        "off" | "false" | "no" | "none" | "0" | "disable" | "disabled" => Ok(NatMode::Off),
+        "out" | "outbound" | "snat" | "tunnel" => Ok(NatMode::Out),
+        "exit" | "in" | "inbound" | "wan" | "masquerade" => Ok(NatMode::Exit),
+        "both" | "all" | "true" | "on" | "yes" | "1" | "out+exit" | "exit+out" => {
+            Ok(NatMode::Both)
+        }
+        _ => Err(format!(
+            "invalid nat mode '{raw}', expected off|out|exit|both|true"
+        )),
+    }
+}
+
+/// Parse DNAT port-forwarding specification:
+/// - `tcp/8080->172.16.1.2:80` | `udp/5353->172.16.1.2:53` | `both/8080->172.16.1.2:80`
+/// - `8080->172.16.1.2:80` (defaults to both TCP & UDP)
+/// - `tcp/8080:172.16.1.2:80` | `tcp/127.0.0.1:8080->172.16.1.2:80`
+/// - `tcp/[::]:8080->[fd00:1::2]:80`
+pub fn parse_dnat_rule(raw: &str) -> Result<DnatRule, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("empty dnat rule".into());
+    }
+    let (proto, rest) = if let Some(r) = trimmed
+        .strip_prefix("tcp/")
+        .or_else(|| trimmed.strip_prefix("TCP/"))
+    {
+        (DnatProto::Tcp, r.trim())
+    } else if let Some(r) = trimmed
+        .strip_prefix("udp/")
+        .or_else(|| trimmed.strip_prefix("UDP/"))
+    {
+        (DnatProto::Udp, r.trim())
+    } else if let Some(r) = trimmed
+        .strip_prefix("both/")
+        .or_else(|| trimmed.strip_prefix("BOTH/"))
+        .or_else(|| trimmed.strip_prefix("all/"))
+        .or_else(|| trimmed.strip_prefix("ALL/"))
+    {
+        (DnatProto::Both, r.trim())
+    } else {
+        (DnatProto::Both, trimmed)
+    };
+
+    let (listen_str, target_str) = if let Some((l, r)) = rest.split_once("->") {
+        (l.trim(), r.trim())
+    } else {
+        // Support `listen_port:target_ipv4:target_port` or `bind_ipv4:listen_port:target_ipv4:target_port`
+        let parts: Vec<&str> = rest.split(':').collect();
+        match parts.as_slice() {
+            [lport, _, _] => (*lport, &rest[lport.len() + 1..]),
+            [lip, lport, _tip, _tport] => {
+                let split_at = lip.len() + 1 + lport.len();
+                (&rest[..split_at], &rest[split_at + 1..])
+            }
+            _ => {
+                return Err(format!(
+                    "invalid dnat rule '{raw}', expected [tcp/|udp/][bind_ip:]port->target_ip:target_port"
+                ));
+            }
+        }
+    };
+
+    let (listen_ip, listen_port) = if let Ok(port) = listen_str.parse::<u16>() {
+        (None, port)
+    } else {
+        let sa: SocketAddr = listen_str.parse().map_err(|_| {
+            format!("invalid listen endpoint '{listen_str}' in dnat rule '{raw}'")
+        })?;
+        (Some(sa.ip()), sa.port())
+    };
+    if listen_port == 0 {
+        return Err(format!("dnat listen port cannot be 0 in '{raw}'"));
+    }
+
+    let target: SocketAddr = target_str
+        .parse()
+        .map_err(|_| format!("invalid target SocketAddr '{target_str}' in dnat rule '{raw}'"))?;
+    if target.port() == 0 || target.ip().is_unspecified() || target.ip().is_multicast() {
+        return Err(format!("invalid dnat target '{target}' in '{raw}'"));
+    }
+
+    Ok(DnatRule {
+        proto,
+        listen_ip,
+        listen_port,
+        target,
+    })
 }
 
 /// Parse keepalive syntax:
@@ -768,6 +993,8 @@ SINGLE-TUNNEL OPTIONS:
     --dont-fragment <no|inherit> DF policy (default: no, env: GRE_DONT_FRAGMENT)
     --clamp-tcp-mss <bool>     Clamp TCP SYN MSS (default: true, env: GRE_CLAMP_TCP_MSS)
     --allow-fast-path <bool>   Fast-path compatibility flag (default: true)
+    --nat <off|out|exit|both>  Pure user-space NAT44/NAT66 (default: off, env: GRE_NAT)
+    --dnat <rule[,rule...]>    Port forward, e.g. tcp/8080->172.16.1.2:80 (env: GRE_DNAT)
     --dns-refresh <dur>        DDNS re-resolve interval (default: 60s, env: GRE_DNS_REFRESH)
     --comment <text>           Optional tunnel comment (env: GRE_COMMENT)
 
@@ -975,6 +1202,70 @@ mod tests {
         assert!(content.contains("GRE_IPSEC_SECRET:"));
         assert!(content.contains("GRE_ENABLED:"));
         assert!(content.contains("GRE_STATUS_FILE:"));
+        assert!(content.contains("GRE_NAT:"));
+        assert!(content.contains("GRE_DNAT:"));
+    }
+
+    #[test]
+    fn test_nat_and_dnat_parsing_and_validation() {
+        assert_eq!(parse_nat_mode("off").unwrap(), NatMode::Off);
+        assert_eq!(parse_nat_mode("out").unwrap(), NatMode::Out);
+        assert_eq!(parse_nat_mode("exit").unwrap(), NatMode::Exit);
+        assert_eq!(parse_nat_mode("both").unwrap(), NatMode::Both);
+        assert_eq!(parse_nat_mode("true").unwrap(), NatMode::Both);
+        assert!(parse_nat_mode("bogus").is_err());
+
+        let r1 = parse_dnat_rule("tcp/8080->172.16.1.2:80").unwrap();
+        assert_eq!(r1.proto, DnatProto::Tcp);
+        assert_eq!(r1.listen_ip, None);
+        assert_eq!(r1.listen_port, 8080);
+        assert_eq!(r1.target, "172.16.1.2:80".parse().unwrap());
+
+        let r2 = parse_dnat_rule("udp/127.0.0.1:5353:172.16.1.2:53").unwrap();
+        assert_eq!(r2.proto, DnatProto::Udp);
+        assert_eq!(r2.listen_ip, Some(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert_eq!(r2.listen_port, 5353);
+        assert_eq!(r2.target, "172.16.1.2:53".parse().unwrap());
+
+        let r3 = parse_dnat_rule("tcp/[::1]:8443->[fd00:1::2]:443").unwrap();
+        assert_eq!(r3.proto, DnatProto::Tcp);
+        assert_eq!(r3.listen_port, 8443);
+        assert_eq!(r3.target, "[fd00:1::2]:443".parse().unwrap());
+
+        // --nat out without --addr must fail fast; --nat exit without --addr is allowed
+        let err_out = parse_cli_and_env(
+            &[
+                "easygre".into(),
+                "--remote".into(),
+                "198.51.100.1".into(),
+                "--nat".into(),
+                "out".into(),
+            ],
+            &BTreeMap::new(),
+        )
+        .unwrap_err();
+        assert!(err_out.contains("requires at least one tunnel address"));
+
+        let ok_exit = parse_cli_and_env(
+            &[
+                "easygre".into(),
+                "--remote".into(),
+                "198.51.100.1".into(),
+                "--nat".into(),
+                "exit".into(),
+                "--dnat".into(),
+                "tcp/8080->172.16.1.2:80".into(),
+                "--dnat".into(),
+                "udp/8080->172.16.1.2:80".into(),
+            ],
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let CliOutcome::Run(cfg) = ok_exit else {
+            panic!("expected Run");
+        };
+        assert_eq!(cfg.tunnels[0].nat, NatMode::Exit);
+        assert_eq!(cfg.tunnels[0].dnat_rules.len(), 2);
     }
 
     #[test]

@@ -4,7 +4,7 @@ use std::ffi::c_ulong;
 use std::fs::{self, File, OpenOptions};
 use std::io::Error as IoError;
 use std::mem::{size_of, zeroed};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -18,16 +18,23 @@ const AF_INET6: c_int = 10;
 const AF_NETLINK: c_int = 16;
 const AF_PACKET: c_int = 17;
 
+const SOCK_STREAM: c_int = 1;
 const SOCK_DGRAM: c_int = 2;
 const SOCK_RAW: c_int = 3;
 const SOCK_NONBLOCK: c_int = 0x800;
 const SOCK_CLOEXEC: c_int = 0x80000;
 
+const IPPROTO_ICMP: c_int = 1;
+const IPPROTO_TCP: c_int = 6;
+const IPPROTO_IPV6: c_int = 41;
 const IPPROTO_GRE: c_int = 47;
+const IPPROTO_ICMPV6: c_int = 58;
 const IPPROTO_RAW: c_int = 255;
 const NETLINK_ROUTE: c_int = 0;
 
 const SOL_SOCKET: c_int = 1;
+const SO_REUSEADDR: c_int = 2;
+const SO_ERROR: c_int = 4;
 const SO_SNDBUF: c_int = 7;
 const SO_RCVBUF: c_int = 8;
 const SO_RCVTIMEO: c_int = 20;
@@ -35,6 +42,7 @@ const SO_BINDTODEVICE: c_int = 25;
 const SO_ATTACH_FILTER: c_int = 26;
 const SO_SNDBUFFORCE: c_int = 32;
 const SO_RCVBUFFORCE: c_int = 33;
+const TCP_NODELAY: c_int = 1;
 const SOL_PACKET: c_int = 263;
 const PACKET_VERSION: c_int = 10;
 const PACKET_TX_RING: c_int = 13;
@@ -56,6 +64,8 @@ const EFD_CLOEXEC: c_int = 0x80000;
 const SOL_IP: c_int = 0;
 const IP_TOS: c_int = 1;
 const IP_MTU_DISCOVER: c_int = 10;
+const IP_FREEBIND: c_int = 15;
+const IPV6_FREEBIND: c_int = 78;
 const IP_PMTUDISC_DONT: c_int = 0;
 const IP_PMTUDISC_DO: c_int = 2;
 
@@ -115,9 +125,13 @@ const IORING_ENTER_GETEVENTS: u32 = 1 << 0;
 const RWF_NOWAIT: u32 = 0x0000_0008;
 
 const EPOLL_CTL_ADD: c_int = 1;
+const EPOLL_CTL_DEL: c_int = 2;
+const EPOLL_CTL_MOD: c_int = 3;
 const EPOLLIN: u32 = 0x001;
+const EPOLLOUT: u32 = 0x004;
 const EPOLLERR: u32 = 0x008;
 const EPOLLHUP: u32 = 0x010;
+const EPOLLRDHUP: u32 = 0x2000;
 
 const SIGINT: c_int = 2;
 const SIGTERM: c_int = 15;
@@ -142,6 +156,7 @@ const RTMGRP_NEIGH: u32 = 4;
 
 const IFA_ADDRESS: u16 = 1;
 const IFA_LOCAL: u16 = 2;
+const IFA_F_NODAD: u8 = 0x02;
 
 const RTA_DST: u16 = 1;
 const RTA_SRC: u16 = 2;
@@ -174,6 +189,15 @@ const ENOTTY: i32 = 25;
 const EMSGSIZE: i32 = 90;
 const EOPNOTSUPP: i32 = 95;
 const EADDRINUSE: i32 = 98;
+const EINPROGRESS: i32 = 115;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EpollReady {
+    pub token: u64,
+    pub readable: bool,
+    pub writable: bool,
+    pub hangup_or_err: bool,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct SendBatchOutcome {
@@ -265,6 +289,16 @@ struct SockAddrIn {
     sin_port: u16,
     sin_addr: [u8; 4],
     sin_zero: [u8; 8],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SockAddrIn6 {
+    sin6_family: u16,
+    sin6_port: u16,
+    sin6_flowinfo: u32,
+    sin6_addr: [u8; 16],
+    sin6_scope_id: u32,
 }
 
 #[repr(C)]
@@ -462,8 +496,16 @@ struct RtNexthop {
 extern "C" {
     fn socket(domain: c_int, ty: c_int, protocol: c_int) -> c_int;
     fn bind(fd: c_int, addr: *const c_void, len: c_uint) -> c_int;
+    fn listen(fd: c_int, backlog: c_int) -> c_int;
     fn connect(fd: c_int, addr: *const c_void, len: c_uint) -> c_int;
     fn getsockname(fd: c_int, addr: *mut c_void, len: *mut c_uint) -> c_int;
+    fn getsockopt(
+        fd: c_int,
+        level: c_int,
+        optname: c_int,
+        optval: *mut c_void,
+        optlen: *mut c_uint,
+    ) -> c_int;
     fn setsockopt(
         fd: c_int,
         level: c_int,
@@ -480,6 +522,14 @@ extern "C" {
         addrlen: c_uint,
     ) -> isize;
     fn recv(fd: c_int, buf: *mut c_void, len: usize, flags: c_int) -> isize;
+    fn recvfrom(
+        fd: c_int,
+        buf: *mut c_void,
+        len: usize,
+        flags: c_int,
+        src_addr: *mut c_void,
+        addrlen: *mut c_uint,
+    ) -> isize;
     fn syscall(num: c_long, ...) -> c_long;
     fn recvmmsg(
         fd: c_int,
@@ -636,6 +686,10 @@ impl InstanceLease {
 
     pub fn bypass_metric(&self) -> u32 {
         BYPASS_METRIC_BASE + self.slot
+    }
+
+    pub fn slot(&self) -> u32 {
+        self.slot
     }
 }
 
@@ -2178,7 +2232,7 @@ impl RawGreSocket {
             let id = self.ip_id;
             self.ip_id = self.ip_id.wrapping_add(1);
             let src = self.local_bind.unwrap_or(Ipv4Addr::UNSPECIFIED);
-            let mut pkt = [0u8; 128];
+            let mut pkt = [0u8; 2048];
             if 20 + payload.len() <= pkt.len() {
                 crate::packet::write_outer_ipv4_gre_header(
                     &mut pkt[..20],
@@ -2464,8 +2518,19 @@ impl Epoll {
     }
 
     pub fn add(&self, fd: i32, token: u64) -> Result<(), String> {
+        self.add_rw(fd, token, true, false)
+    }
+
+    pub fn add_rw(&self, fd: i32, token: u64, readable: bool, writable: bool) -> Result<(), String> {
+        let mut flags = EPOLLERR | EPOLLHUP | EPOLLRDHUP;
+        if readable {
+            flags |= EPOLLIN;
+        }
+        if writable {
+            flags |= EPOLLOUT;
+        }
         let mut ev = EpollEvent {
-            events: EPOLLIN | EPOLLERR | EPOLLHUP,
+            events: flags,
             data: token,
         };
         let rc = unsafe { epoll_ctl(self.fd.as_raw_fd(), EPOLL_CTL_ADD, fd, &mut ev) };
@@ -2473,6 +2538,32 @@ impl Epoll {
             return Err(format!("epoll_ctl(ADD, fd={fd}) failed: {}", IoError::last_os_error()));
         }
         Ok(())
+    }
+
+    pub fn mod_rw(&self, fd: i32, token: u64, readable: bool, writable: bool) -> Result<(), String> {
+        let mut flags = EPOLLERR | EPOLLHUP | EPOLLRDHUP;
+        if readable {
+            flags |= EPOLLIN;
+        }
+        if writable {
+            flags |= EPOLLOUT;
+        }
+        let mut ev = EpollEvent {
+            events: flags,
+            data: token,
+        };
+        let rc = unsafe { epoll_ctl(self.fd.as_raw_fd(), EPOLL_CTL_MOD, fd, &mut ev) };
+        if rc < 0 {
+            return Err(format!("epoll_ctl(MOD, fd={fd}) failed: {}", IoError::last_os_error()));
+        }
+        Ok(())
+    }
+
+    pub fn del(&self, fd: i32) {
+        let mut ev = EpollEvent { events: 0, data: 0 };
+        unsafe {
+            let _ = epoll_ctl(self.fd.as_raw_fd(), EPOLL_CTL_DEL, fd, &mut ev);
+        }
     }
 
     pub fn wait(&self, tokens_out: &mut [u64], timeout_ms: i32) -> Result<usize, IoError> {
@@ -2487,6 +2578,354 @@ impl Epoll {
             tokens_out[i] = events[i].data;
         }
         Ok(count)
+    }
+
+    pub fn wait_ready(&self, ready_out: &mut [EpollReady], timeout_ms: i32) -> Result<usize, IoError> {
+        let cap = ready_out.len().min(128);
+        let mut events = [EpollEvent { events: 0, data: 0 }; 128];
+        let n = unsafe { epoll_wait(self.fd.as_raw_fd(), events.as_mut_ptr(), cap as c_int, timeout_ms) };
+        if n < 0 {
+            return Err(IoError::last_os_error());
+        }
+        let count = n as usize;
+        for i in 0..count {
+            let ev_flags = events[i].events;
+            let ev_tok = events[i].data;
+            ready_out[i] = EpollReady {
+                token: ev_tok,
+                readable: (ev_flags & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR)) != 0,
+                writable: (ev_flags & (EPOLLOUT | EPOLLHUP | EPOLLERR)) != 0,
+                hangup_or_err: (ev_flags & (EPOLLERR | EPOLLHUP)) != 0,
+            };
+        }
+        Ok(count)
+    }
+}
+
+pub fn bind_socket_to_device(fd: i32, ifname: &str) {
+    if ifname.is_empty() || ifname.len() > 15 {
+        return;
+    }
+    let mut c_if = [0u8; 16];
+    c_if[..ifname.len()].copy_from_slice(ifname.as_bytes());
+    unsafe {
+        let _ = setsockopt(
+            fd,
+            SOL_SOCKET,
+            SO_BINDTODEVICE,
+            c_if.as_ptr().cast(),
+            (ifname.len() + 1) as c_uint,
+        );
+    }
+}
+
+pub fn bind_nonblock_tcp_listener(
+    addr: SocketAddr,
+    freebind: bool,
+) -> Result<TcpListener, IoError> {
+    let domain = match addr {
+        SocketAddr::V4(_) => AF_INET,
+        SocketAddr::V6(_) => AF_INET6,
+    };
+    let raw = unsafe { socket(domain, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0) };
+    if raw < 0 {
+        return Err(IoError::last_os_error());
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let one: c_int = 1;
+    unsafe {
+        let _ = setsockopt(
+            fd.as_raw_fd(),
+            SOL_SOCKET,
+            SO_REUSEADDR,
+            (&one as *const c_int).cast(),
+            size_of::<c_int>() as c_uint,
+        );
+        if freebind {
+            let _ = setsockopt(
+                fd.as_raw_fd(),
+                SOL_IP,
+                IP_FREEBIND,
+                (&one as *const c_int).cast(),
+                size_of::<c_int>() as c_uint,
+            );
+            if domain == AF_INET6 {
+                let _ = setsockopt(
+                    fd.as_raw_fd(),
+                    IPPROTO_IPV6,
+                    IPV6_FREEBIND,
+                    (&one as *const c_int).cast(),
+                    size_of::<c_int>() as c_uint,
+                );
+            }
+        }
+    }
+    let rc = match addr {
+        SocketAddr::V4(v4) => {
+            let sa = SockAddrIn {
+                sin_family: AF_INET as u16,
+                sin_port: v4.port().to_be(),
+                sin_addr: v4.ip().octets(),
+                sin_zero: [0u8; 8],
+            };
+            unsafe {
+                bind(
+                    fd.as_raw_fd(),
+                    (&sa as *const SockAddrIn).cast(),
+                    size_of::<SockAddrIn>() as c_uint,
+                )
+            }
+        }
+        SocketAddr::V6(v6) => {
+            let sa6 = SockAddrIn6 {
+                sin6_family: AF_INET6 as u16,
+                sin6_port: v6.port().to_be(),
+                sin6_flowinfo: v6.flowinfo(),
+                sin6_addr: v6.ip().octets(),
+                sin6_scope_id: v6.scope_id(),
+            };
+            unsafe {
+                bind(
+                    fd.as_raw_fd(),
+                    (&sa6 as *const SockAddrIn6).cast(),
+                    size_of::<SockAddrIn6>() as c_uint,
+                )
+            }
+        }
+    };
+    if rc < 0 {
+        return Err(IoError::last_os_error());
+    }
+    let lrc = unsafe { listen(fd.as_raw_fd(), 1024) };
+    if lrc < 0 {
+        return Err(IoError::last_os_error());
+    }
+    Ok(TcpListener::from(fd))
+}
+
+pub fn open_nonblock_tcp_stream(
+    target: SocketAddr,
+    bind_ifname: Option<&str>,
+) -> Result<TcpStream, IoError> {
+    let domain = match target {
+        SocketAddr::V4(_) => AF_INET,
+        SocketAddr::V6(_) => AF_INET6,
+    };
+    let raw = unsafe { socket(domain, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0) };
+    if raw < 0 {
+        return Err(IoError::last_os_error());
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let one: c_int = 1;
+    unsafe {
+        let _ = setsockopt(
+            fd.as_raw_fd(),
+            IPPROTO_TCP,
+            TCP_NODELAY,
+            (&one as *const c_int).cast(),
+            size_of::<c_int>() as c_uint,
+        );
+    }
+    if let Some(ifname) = bind_ifname {
+        bind_socket_to_device(fd.as_raw_fd(), ifname);
+    }
+    let rc = match target {
+        SocketAddr::V4(v4) => {
+            let sa = SockAddrIn {
+                sin_family: AF_INET as u16,
+                sin_port: v4.port().to_be(),
+                sin_addr: v4.ip().octets(),
+                sin_zero: [0u8; 8],
+            };
+            unsafe {
+                connect(
+                    fd.as_raw_fd(),
+                    (&sa as *const SockAddrIn).cast(),
+                    size_of::<SockAddrIn>() as c_uint,
+                )
+            }
+        }
+        SocketAddr::V6(v6) => {
+            let sa6 = SockAddrIn6 {
+                sin6_family: AF_INET6 as u16,
+                sin6_port: v6.port().to_be(),
+                sin6_flowinfo: v6.flowinfo(),
+                sin6_addr: v6.ip().octets(),
+                sin6_scope_id: v6.scope_id(),
+            };
+            unsafe {
+                connect(
+                    fd.as_raw_fd(),
+                    (&sa6 as *const SockAddrIn6).cast(),
+                    size_of::<SockAddrIn6>() as c_uint,
+                )
+            }
+        }
+    };
+    if rc < 0 {
+        let err = IoError::last_os_error();
+        if err.raw_os_error() != Some(EINPROGRESS) {
+            return Err(err);
+        }
+    }
+    Ok(TcpStream::from(fd))
+}
+
+pub fn check_socket_connect_err(fd: i32) -> Result<(), IoError> {
+    let mut err_code: c_int = 0;
+    let mut len = size_of::<c_int>() as c_uint;
+    let rc = unsafe {
+        getsockopt(
+            fd,
+            SOL_SOCKET,
+            SO_ERROR,
+            (&mut err_code as *mut c_int).cast(),
+            &mut len,
+        )
+    };
+    if rc < 0 {
+        return Err(IoError::last_os_error());
+    }
+    if err_code != 0 {
+        return Err(IoError::from_raw_os_error(err_code));
+    }
+    Ok(())
+}
+
+pub struct RawIcmpSocket {
+    fd: OwnedFd,
+    is_v6: bool,
+}
+
+impl RawIcmpSocket {
+    pub fn open_v4(bind_ifname: Option<&str>) -> Result<Self, String> {
+        let raw = unsafe { socket(AF_INET, SOCK_RAW | SOCK_NONBLOCK | SOCK_CLOEXEC, IPPROTO_ICMP) };
+        if raw < 0 {
+            return Err(format!(
+                "socket(AF_INET, SOCK_RAW, IPPROTO_ICMP) failed: {}",
+                IoError::last_os_error()
+            ));
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        if let Some(ifn) = bind_ifname {
+            bind_socket_to_device(fd.as_raw_fd(), ifn);
+        }
+        Ok(Self { fd, is_v6: false })
+    }
+
+    pub fn open_v6(bind_ifname: Option<&str>) -> Result<Self, String> {
+        let raw =
+            unsafe { socket(AF_INET6, SOCK_RAW | SOCK_NONBLOCK | SOCK_CLOEXEC, IPPROTO_ICMPV6) };
+        if raw < 0 {
+            return Err(format!(
+                "socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6) failed: {}",
+                IoError::last_os_error()
+            ));
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        if let Some(ifn) = bind_ifname {
+            bind_socket_to_device(fd.as_raw_fd(), ifn);
+        }
+        Ok(Self { fd, is_v6: true })
+    }
+
+    pub fn raw_fd(&self) -> i32 {
+        self.fd.as_raw_fd()
+    }
+
+    pub fn send_v4(&self, dst: Ipv4Addr, icmp_pkt: &[u8]) -> Result<usize, IoError> {
+        if self.is_v6 {
+            return Err(IoError::from_raw_os_error(EINVAL));
+        }
+        let sa = SockAddrIn {
+            sin_family: AF_INET as u16,
+            sin_port: 0,
+            sin_addr: dst.octets(),
+            sin_zero: [0u8; 8],
+        };
+        let n = unsafe {
+            sendto(
+                self.fd.as_raw_fd(),
+                icmp_pkt.as_ptr().cast(),
+                icmp_pkt.len(),
+                MSG_DONTWAIT,
+                (&sa as *const SockAddrIn).cast(),
+                size_of::<SockAddrIn>() as c_uint,
+            )
+        };
+        if n < 0 {
+            Err(IoError::last_os_error())
+        } else {
+            Ok(n as usize)
+        }
+    }
+
+    pub fn recv_v4(&self, buf: &mut [u8]) -> Result<(usize, Ipv4Addr), IoError> {
+        let mut sa: SockAddrIn = unsafe { zeroed() };
+        let mut addrlen = size_of::<SockAddrIn>() as c_uint;
+        let n = unsafe {
+            recvfrom(
+                self.fd.as_raw_fd(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                MSG_DONTWAIT,
+                (&mut sa as *mut SockAddrIn).cast(),
+                &mut addrlen,
+            )
+        };
+        if n < 0 {
+            Err(IoError::last_os_error())
+        } else {
+            Ok((n as usize, Ipv4Addr::from(sa.sin_addr)))
+        }
+    }
+
+    pub fn send_v6(&self, dst: Ipv6Addr, icmp6_pkt: &[u8]) -> Result<usize, IoError> {
+        if !self.is_v6 {
+            return Err(IoError::from_raw_os_error(EINVAL));
+        }
+        let sa6 = SockAddrIn6 {
+            sin6_family: AF_INET6 as u16,
+            sin6_port: 0,
+            sin6_flowinfo: 0,
+            sin6_addr: dst.octets(),
+            sin6_scope_id: 0,
+        };
+        let n = unsafe {
+            sendto(
+                self.fd.as_raw_fd(),
+                icmp6_pkt.as_ptr().cast(),
+                icmp6_pkt.len(),
+                MSG_DONTWAIT,
+                (&sa6 as *const SockAddrIn6).cast(),
+                size_of::<SockAddrIn6>() as c_uint,
+            )
+        };
+        if n < 0 {
+            Err(IoError::last_os_error())
+        } else {
+            Ok(n as usize)
+        }
+    }
+
+    pub fn recv_v6(&self, buf: &mut [u8]) -> Result<(usize, Ipv6Addr), IoError> {
+        let mut sa6: SockAddrIn6 = unsafe { zeroed() };
+        let mut addrlen = size_of::<SockAddrIn6>() as c_uint;
+        let n = unsafe {
+            recvfrom(
+                self.fd.as_raw_fd(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                MSG_DONTWAIT,
+                (&mut sa6 as *mut SockAddrIn6).cast(),
+                &mut addrlen,
+            )
+        };
+        if n < 0 {
+            Err(IoError::last_os_error())
+        } else {
+            Ok((n as usize, Ipv6Addr::from(sa6.sin6_addr)))
+        }
     }
 }
 
@@ -3035,6 +3474,118 @@ fn find_first_ipv4_on_ifindex(nl: &mut NetlinkSocket, target_ifindex: u32) -> Op
     None
 }
 
+pub fn list_host_local_ips() -> (Vec<Ipv4Addr>, Vec<Ipv6Addr>) {
+    let mut v4_out = Vec::new();
+    let mut v6_out = Vec::new();
+    let Ok(mut nl) = NetlinkSocket::open() else {
+        return (v4_out, v6_out);
+    };
+    for family in [AF_INET as u8, AF_INET6 as u8] {
+        let mut req = Vec::with_capacity(64);
+        let hdr = NlMsgHdr {
+            nlmsg_len: 0,
+            nlmsg_type: RTM_GETADDR,
+            nlmsg_flags: NLM_F_REQUEST | NLM_F_DUMP,
+            nlmsg_seq: 0,
+            nlmsg_pid: 0,
+        };
+        push_struct(&mut req, &hdr);
+        let ifa = IfAddrMsg {
+            ifa_family: family,
+            ifa_prefixlen: 0,
+            ifa_flags: 0,
+            ifa_scope: 0,
+            ifa_index: 0,
+        };
+        push_struct(&mut req, &ifa);
+        let Ok(raw) = nl.send_and_dump(&mut req) else {
+            continue;
+        };
+        let mut off = 0usize;
+        while off + size_of::<NlMsgHdr>() + size_of::<IfAddrMsg>() <= raw.len() {
+            let nh = unsafe { std::ptr::read_unaligned(raw[off..].as_ptr() as *const NlMsgHdr) };
+            let mlen = nh.nlmsg_len as usize;
+            if mlen < size_of::<NlMsgHdr>() + size_of::<IfAddrMsg>() || off + mlen > raw.len() {
+                break;
+            }
+            if nh.nlmsg_type == RTM_NEWADDR {
+                let msg = unsafe {
+                    std::ptr::read_unaligned(
+                        raw[off + size_of::<NlMsgHdr>()..].as_ptr() as *const IfAddrMsg,
+                    )
+                };
+                let mut aoff = off + size_of::<NlMsgHdr>() + size_of::<IfAddrMsg>();
+                let mend = off + mlen;
+                let mut local_v4: Option<Ipv4Addr> = None;
+                let mut addr_v4: Option<Ipv4Addr> = None;
+                while aoff + size_of::<RtAttr>() <= mend {
+                    let rta =
+                        unsafe { std::ptr::read_unaligned(raw[aoff..].as_ptr() as *const RtAttr) };
+                    let alen = rta.rta_len as usize;
+                    if alen < size_of::<RtAttr>() || aoff + alen > mend {
+                        break;
+                    }
+                    let p = &raw[aoff + size_of::<RtAttr>()..aoff + alen];
+                    if msg.ifa_family == AF_INET as u8 && p.len() >= 4 {
+                        // On POINTOPOINT interfaces IFA_LOCAL is our local IP while IFA_ADDRESS is peer IP
+                        if rta.rta_type == IFA_LOCAL {
+                            local_v4 = Some(Ipv4Addr::new(p[0], p[1], p[2], p[3]));
+                        } else if rta.rta_type == IFA_ADDRESS {
+                            addr_v4 = Some(Ipv4Addr::new(p[0], p[1], p[2], p[3]));
+                        }
+                    } else if msg.ifa_family == AF_INET6 as u8
+                        && matches!(rta.rta_type, IFA_LOCAL | IFA_ADDRESS)
+                        && p.len() >= 16
+                    {
+                        let mut oct = [0u8; 16];
+                        oct.copy_from_slice(&p[..16]);
+                        let ip6 = Ipv6Addr::from(oct);
+                        if !v6_out.contains(&ip6) {
+                            v6_out.push(ip6);
+                        }
+                    }
+                    let aligned = (alen + 3) & !3;
+                    aoff += aligned.max(size_of::<RtAttr>());
+                }
+                if let Some(ip) = local_v4.or(addr_v4) {
+                    if !v4_out.contains(&ip) {
+                        v4_out.push(ip);
+                    }
+                }
+            }
+            off += (mlen + 3) & !3;
+        }
+    }
+    (v4_out, v6_out)
+}
+
+pub fn enable_ip_forwarding(enable_v4: bool, enable_v6: bool) {
+    if enable_v4 {
+        let p4 = "/proc/sys/net/ipv4/ip_forward";
+        if fs::read_to_string(p4)
+            .map(|s| s.trim() == "0")
+            .unwrap_or(false)
+        {
+            match fs::write(p4, b"1\n") {
+                Ok(()) => eprintln!("[info] enabled kernel IPv4 forwarding ({p4}=1)"),
+                Err(e) => eprintln!("[warn] could not set {p4}=1 ({e}); user-space NAT remains active"),
+            }
+        }
+    }
+    if enable_v6 {
+        let p6 = "/proc/sys/net/ipv6/conf/all/forwarding";
+        if fs::read_to_string(p6)
+            .map(|s| s.trim() == "0")
+            .unwrap_or(false)
+        {
+            match fs::write(p6, b"1\n") {
+                Ok(()) => eprintln!("[info] enabled kernel IPv6 forwarding ({p6}=1)"),
+                Err(e) => eprintln!("[warn] could not set {p6}=1 ({e}); user-space NAT66 remains active"),
+            }
+        }
+    }
+}
+
 /// Remove leftover `RTPROT_EASYGRE` bypass routes belonging ONLY to dead (`SIGKILL`ed) EasyGRE
 /// instance slots, leaving all routes owned by live sibling containers/processes intact.
 pub fn cleanup_stale_easygre_routes(lease: &InstanceLease, legacy_status_orphan: bool) {
@@ -3356,7 +3907,7 @@ pub fn configure_interface_addr(ifindex: u32, cidr: &IpCidr) -> Result<(), Strin
             let ifa = IfAddrMsg {
                 ifa_family: AF_INET6 as u8,
                 ifa_prefixlen: *prefix_len,
-                ifa_flags: 0,
+                ifa_flags: IFA_F_NODAD,
                 ifa_scope: RT_SCOPE_UNIVERSE,
                 ifa_index: ifindex,
             };
@@ -3649,6 +4200,7 @@ mod tests {
     fn test_linux_abi_struct_sizes() {
         assert_eq!(size_of::<IfReq>(), 40);
         assert_eq!(size_of::<SockAddrIn>(), 16);
+        assert_eq!(size_of::<SockAddrIn6>(), 28);
         assert_eq!(size_of::<SockAddrUn>(), 110);
         assert_eq!(size_of::<SockAddrNl>(), 12);
         assert_eq!(size_of::<TimeSpec>(), 16);

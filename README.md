@@ -1,13 +1,14 @@
 # EasyGRE
 
-零外部依赖（`Cargo.toml` 无第三方 crate）的 Rust 用户态三层 GRE 隧道守护进程，完整支持标准 GRE 封装、双向 Keepalive 探测与载波联动、多隧道并发、IPv4/IPv6 内层双栈、TCP MSS 钳制、1:1 NAT 公网 IP 自学习，以及基于 `FROM scratch` 镜像的一键 Docker 部署。
+零外部依赖（`Cargo.toml` 无第三方 crate）的 Rust 用户态三层 GRE 隧道守护进程，完整支持标准 GRE 封装、穿透 1:1 NAT + `masquerade` 的自适应多层 Keepalive 探测与载波联动、纯用户态内置 NAT44/NAT66 与端口映射（`--nat` / `--dnat`）、多隧道并发、IPv4/IPv6 内层双栈、TCP MSS 钳制，以及基于 `FROM scratch` 镜像的一键 Docker 部署。
 
 ## 特性
 
-- **零外部依赖**：仅依赖 Rust 标准库（`std`）与内联 Linux 系统调用（`ioctl`、`AF_NETLINK`、`io_uring`、`epoll`、`SOCK_RAW`），`x86_64` musl 静态编译后为单个约 730 KB ELF 二进制，容器内无需 `ip_gre` 内核模块、`iproute2`、`iptables` 或 `nftables`。
+- **零外部依赖**：仅依赖 Rust 标准库（`std`）与内联 Linux 系统调用（`ioctl`、`AF_NETLINK`、`io_uring`、`epoll`、`SOCK_RAW`），`x86_64` musl 静态编译后为单个约 850 KB ELF 二进制，容器内无需 `ip_gre` 内核模块、`iproute2`、`iptables` 或 `nftables`。
+- **纯用户态内置 NAT 与端口映射**：零内核 `netfilter` / `nf_tables` 依赖，在 `FROM scratch` 容器内直接提供隧道出向伪装（`--nat out`）、出口落地伪装（`--nat exit`）、双向复合伪装（`--nat both`）以及宿主机端口映射（`--dnat tcp/8080->172.16.1.2:80`），完整覆盖 IPv4/IPv6 的 TCP（无缝兼容 64 KB TSO/GRO）、UDP 与 ICMP Echo / Error 报文转换，并自动开启三层转发。
 - **纯用户态高性能转发**：支持内联 `io_uring`（`IORING_OP_READV + RWF_NOWAIT`）批量零拷贝将 `TUN` 报文直读入 `AF_PACKET` `PACKET_TX_RING` (`TPACKET_V2`) 2048 帧共享内存环（容器禁用 `io_uring` 时自动降级为零拷贝 `readv`）、`IPPROTO_RAW` 出站套接字隔离（消除入站 `raw_v4_input` 多余 `skb_clone`）、`IFF_VNET_HDR` TCP TSO 与 Linux 6.2+ UDP GSO（`TUN_F_USO4 | TUN_F_USO6`）零拷贝切片、16 槽位双协议（TCP + UDP）RX GRO 合并、`IFF_MULTI_QUEUE` 多核 TX 队列池以及 L2 友好的 128 槽奇步长 `recvmmsg` 批量收包。
 - **完整三层 GRE 协议能力**：
-  - **Keepalive**：实现带 32-bit 随机探测令牌关联校验的双向 GRE-in-GRE (`PT=0x0000`) 探测与应答，防伪造保活回包；连续未响应达到重试次数后摘除载波并切换为 `down`，对端恢复后自动拉起；兼容 `10s,10`、`00:00:10,10`、`off`。
+  - **自适应多层 Keepalive（默认开启）**：实现带 32-bit 随机探测令牌关联校验的自适应双向保活机制（优先标准 `GRE-in-GRE PT=0x0000`；当对端位于 1:1 NAT + `srcnat masquerade` 后导致外层 GRE `nf_conntrack` 元组冲突丢弃回弹包，或对端为无主动保活的 Linux `ip_gre` 时，自动无感降级至隧道内 `ICMPv4/v6 Echo`、`TTL=1` 路由回弹及 `UDP-in-GRE` 端口不可达回弹），无需关闭 `GRE_KEEPALIVE` 即可防死链并联动网卡载波；兼容 `10s,10`、`00:00:10,10`、`off`。
   - **MTU / Actual MTU**：`auto` 模式自动探测到对端物理出接口 MTU 并减去 24 字节（标准 1500 接口下得出 `1476`）。
   - **Clamp TCP MSS**：用户态双向拦截 IPv4/IPv6 TCP `SYN`/`SYN+ACK`，将 MSS 钳制到 `MTU - 40`（IPv4）或 `MTU - 60`（IPv6）并按 RFC 1624 增量更新 TCP 校验和。
   - **DSCP / Dont Fragment**：`dscp` 支持 `inherit` 或 `0..63`；`dont-fragment` 支持 `no`（允许外层分片）与 `inherit`（跟随内层 IPv4 DF，超路径 MTU 时自动向 TUN 内层源回送 ICMPv4 Frag Needed / ICMPv6 Packet Too Big）。
@@ -126,7 +127,9 @@ easygre
 | `--addr <cidr[,...]>` | `GRE_ADDR` | 空 | 隧道接口 IPv4/IPv6 CIDR，逗号分隔 |
 | `--route <spec[,...]>` | `GRE_ROUTE` | 空 | 静态路由，支持 `10.1.0.0/16` 或 `10.1.0.0/16 via 172.16.1.1` |
 | `--mtu <auto\|num>` | `GRE_MTU` | `auto` | 范围 `68..65500`，`auto` 为物理出接口 MTU 减 24 |
-| `--keepalive <spec>` | `GRE_KEEPALIVE` | `10s,10` | 支持 `10s,10`、`00:00:10,10`、`1m,5`、`off`（间隔 `1s..3600s`，重试 `1..1000`） |
+| `--keepalive <spec>` | `GRE_KEEPALIVE` | `10s,10` | 默认开启；支持 `10s,10`、`00:00:10,10`、`1m,5`、`off`（间隔 `1s..3600s`，重试 `1..1000`） |
+| `--nat <off\|out\|exit\|both>` | `GRE_NAT` | `off` | 纯用户态内置 NAT：`out` 隧道出向伪装（需配置 `--addr`）、`exit` 出口落地 WAN 伪装、`both` 同时开启（亦支持 `--no-nat`） |
+| `--dnat <rule[,...]>` | `GRE_DNAT` | 空 | 纯用户态端口映射（可重复传参或逗号分隔），支持 `[tcp\|udp\|both/][listen_ip:]port->target_ip:port` |
 | `--dscp <inherit\|0..63>` | `GRE_DSCP` | `inherit` | 外层 IPv4 TOS 的 DSCP 字段策略 |
 | `--dont-fragment <no\|inherit>` | `GRE_DONT_FRAGMENT` | `no` | 外层 DF 位策略；仅支持 `no` 或 `inherit`（显式拒收 `yes`） |
 | `--clamp-tcp-mss <bool>` | `GRE_CLAMP_TCP_MSS` | `true` | 亦可用 `--no-clamp-tcp-mss` 关闭 |
@@ -154,7 +157,27 @@ GRE_KEEPALIVE=10s,10
 
 节点 B 若同样运行 EasyGRE，只需将 `GRE_REMOTE` 设为 `198.51.100.10`、`GRE_ADDR` 设为 `172.16.1.1/30`、`GRE_ROUTE` 设为 `10.2.202.0/24`；若节点 B 为硬件路由器或标准三层 GRE 设备，按标准 GRE 协议放行 IP 协议号 47 并配置匹配的 `remote-address`、`keepalive=10s,10`、`mtu=auto` 与隧道地址即可互通。
 
-更多配置示例（IPv6 双栈、云主机 1:1 NAT、全局默认路由防环回、Linux `ip_gre` 互通与排错）请参阅 [GRE 协议适配与运维排错指南](docs/gre-guide.md)。
+### 内置纯用户态 NAT 与端口映射示例
+
+无需在宿主机编写任何 `iptables` / `nftables` 规则：
+
+```bash
+# 入口节点 A：将内网子网流量做隧道源地址伪装（对端无需配置回程路由）
+easygre --name gre-in \
+  --remote 203.0.113.1 \
+  --addr 172.16.1.2/30,fd00:1::2/126 \
+  --nat out \
+  --route 0.0.0.0/0
+
+# 出口落地节点 B：为隧道流量做公网出口伪装，并将本机 8080/5353 映射至节点 A
+easygre --name gre-exit \
+  --remote 198.51.100.10 \
+  --addr 172.16.1.1/30,fd00:1::1/126 \
+  --nat exit \
+  --dnat "tcp/8080->172.16.1.2:80,udp/5353->172.16.1.2:53"
+```
+
+更多配置示例（IPv6 双栈、云主机 1:1 NAT + `masquerade` 保活穿透、全局默认路由防环回、Linux `ip_gre` 互通与排错）请参阅 [GRE 协议适配与运维排错指南](docs/gre-guide.md)。
 
 ## 状态输出与健康检查
 

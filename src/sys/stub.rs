@@ -1,4 +1,4 @@
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 
 use crate::config::RouteSpec;
 use crate::packet::IpCidr;
@@ -6,6 +6,7 @@ use crate::sys::RouteProbeResult;
 
 pub struct TunDevice;
 pub struct RawGreSocket;
+pub struct RawIcmpSocket;
 pub struct Epoll;
 pub struct EventFd;
 pub struct PacketTxRing;
@@ -14,12 +15,23 @@ pub struct RxBatchBuffer;
 pub struct NeighWatchSocket;
 pub struct InstanceLease;
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EpollReady {
+    pub token: u64,
+    pub readable: bool,
+    pub writable: bool,
+    pub hangup_or_err: bool,
+}
+
 impl InstanceLease {
     pub fn acquire() -> Result<Self, String> {
         Ok(Self)
     }
     pub fn bypass_metric(&self) -> u32 {
         19801
+    }
+    pub fn slot(&self) -> u32 {
+        1
     }
 }
 
@@ -223,10 +235,71 @@ impl Epoll {
     pub fn add(&self, _fd: i32, _token: u64) -> Result<(), String> {
         Err("unsupported OS".into())
     }
+    pub fn add_rw(&self, _fd: i32, _token: u64, _readable: bool, _writable: bool) -> Result<(), String> {
+        Err("unsupported OS".into())
+    }
+    pub fn mod_rw(&self, _fd: i32, _token: u64, _readable: bool, _writable: bool) -> Result<(), String> {
+        Err("unsupported OS".into())
+    }
+    pub fn del(&self, _fd: i32) {}
     pub fn wait(&self, _events: &mut [u64], _timeout_ms: i32) -> Result<usize, std::io::Error> {
         Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
     }
+    pub fn wait_ready(
+        &self,
+        _ready_out: &mut [EpollReady],
+        _timeout_ms: i32,
+    ) -> Result<usize, std::io::Error> {
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+    }
 }
+
+impl RawIcmpSocket {
+    pub fn open_v4(_bind_ifname: Option<&str>) -> Result<Self, String> {
+        Err("unsupported OS".into())
+    }
+    pub fn open_v6(_bind_ifname: Option<&str>) -> Result<Self, String> {
+        Err("unsupported OS".into())
+    }
+    pub fn raw_fd(&self) -> i32 {
+        -1
+    }
+    pub fn send_v4(&self, _dst: Ipv4Addr, _icmp_pkt: &[u8]) -> Result<usize, std::io::Error> {
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+    }
+    pub fn recv_v4(&self, _buf: &mut [u8]) -> Result<(usize, Ipv4Addr), std::io::Error> {
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+    }
+    pub fn send_v6(&self, _dst: Ipv6Addr, _icmp6_pkt: &[u8]) -> Result<usize, std::io::Error> {
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+    }
+    pub fn recv_v6(&self, _buf: &mut [u8]) -> Result<(usize, Ipv6Addr), std::io::Error> {
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+    }
+}
+
+pub fn bind_socket_to_device(_fd: i32, _ifname: &str) {}
+pub fn bind_nonblock_tcp_listener(
+    addr: SocketAddr,
+    _freebind: bool,
+) -> Result<TcpListener, std::io::Error> {
+    let l = TcpListener::bind(addr)?;
+    l.set_nonblocking(true)?;
+    Ok(l)
+}
+pub fn open_nonblock_tcp_stream(
+    _target: SocketAddr,
+    _bind_ifname: Option<&str>,
+) -> Result<TcpStream, std::io::Error> {
+    Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+}
+pub fn check_socket_connect_err(_fd: i32) -> Result<(), std::io::Error> {
+    Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+}
+pub fn list_host_local_ips() -> (Vec<Ipv4Addr>, Vec<Ipv6Addr>) {
+    (Vec::new(), Vec::new())
+}
+pub fn enable_ip_forwarding(_enable_v4: bool, _enable_v6: bool) {}
 
 pub fn install_signal_handlers() {}
 pub fn shutdown_requested() -> bool {

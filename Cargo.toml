@@ -1,8 +1,8 @@
 [package]
 name = "easygre"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Zero-dependency Rust user-space GRE tunnel daemon with bidirectional keepalive and TCP MSS clamping"
+description = "Zero-dependency Rust user-space GRE tunnel daemon with adaptive keepalive, built-in NAT, and TCP MSS clamping"
 license = "MIT"
 repository = "https://github.com/aurorax-neo/EasyGRE"
 

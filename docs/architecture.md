@@ -9,7 +9,8 @@ EasyGRE 的核心设计目标是在**零第三方 Crate 依赖**与**零外部�
 | [main.rs](../src/main.rs) | CLI 子命令路由（`run`、`status`、`healthcheck`、`version`、`help`）与退出码映射 |
 | [config.rs](../src/config.rs) | 命令行与环境变量解析（单隧道、多隧道 `--tunnel`/`GRE_TUNNELS`/`GRE_<N>_*`、时间格式与布尔参数兼容校验） |
 | [engine.rs](../src/engine.rs) | 控制面主循环、专职 `gre-rx` 收包线程、每队列 `tx-<name>-q<i>` 并行转发线程、ARP 邻居 MAC 缓存与防环回路由管理 |
-| [gre.rs](../src/gre.rs) | RFC 2784/2890 GRE 头部编解码、可选 `C=1` Checksum 验证、GRE-in-GRE Keepalive 探测与应答报文构造及 NAT 公网 IP 提取 |
+| [gre.rs](../src/gre.rs) | RFC 2784/2890 GRE 头部编解码、可选 `C=1` Checksum 验证、自适应多层 Keepalive（`GRE-in-GRE` / 隧道内 `ICMPv4/v6 Echo` / `TTL=1` / `UDP-in-GRE`）报文构造与 NAT 公网 IP 提取 |
+| [nat.rs](../src/nat.rs) | 零内核 `netfilter` 依赖的纯用户态 NAT44/NAT66 与 DNAT 引擎（`OutboundSnatInner`、每实例隔离 `TcpPortalTable`、`ExitDgramState` 及非阻塞 `epoll` 中继线程） |
 | [packet.rs](../src/packet.rs) | 内层 IPv4/IPv6 首部识别、4 路原生字节序无 `bswap` 快速校验和、TCP MSS 钳制（RFC 1624）、零拷贝 TCP TSO / UDP GSO (`GSO_UDP_L4`) 切片器、16 槽位双协议 RX GRO 合并器与对称 5 元组队列哈希 |
 | [keepalive.rs](../src/keepalive.rs) | 双向 Keepalive 载波状态机（`AlwaysUp` / `Initial` / `Up` / `Down`）与精确 `awaiting_reply` 计数 |
 | [status.rs](../src/status.rs) | 基于 `O_CREAT \| O_EXCL \| O_NOFOLLOW`（`0600`）随机临时文件的防符号链接状态写入与线程心跳校验（默认 `/run/easygre/status`） |
@@ -56,7 +57,15 @@ EasyGRE 的核心设计目标是在**零第三方 Crate 依赖**与**零外部�
 - **IPv6**：顺序跳过常见无状态扩展头（`0` Hop-by-Hop、`43` Routing、`60` Destination Options、首片 `44` Fragment）定位 TCP 段，目标最大 MSS 为 `tunnel_mtu - 60`。
 - **奇偶对齐的 RFC 1624 增量修正**：当 TCP Options 在 MSS 前包含单字节 `NOP (1)` 导致 MSS 值位于 TCP 段奇偏移时，直接按 2 字节对齐边界（`val_offset & !1`）读取修改前后的完整 16-bit 字对，逐字应用 RFC 1624 增量更新 `tcp[16..18]`，保证与全量伪首部校验和逐比特一致。
 
-## 4. Linux ABI 与 Netlink 自动化
+## 4. 纯用户态 NAT44/NAT66 与多层保活架构
+
+- **穿透 1:1 NAT + `masquerade` 的自适应保活**：针对云端对端出接口配置 `srcnat masquerade` 时内层 `GRE-in-GRE` 回弹包与外层 GRE 隧道竞争同一 `(src, dst, proto=47, srckey=0, dstkey=0)` `nf_conntrack` 元组而被内核丢弃的问题，`engine.rs` 在保持 `GRE_KEEPALIVE=10s,10` 默认开启的前提下，以 150ms~400ms 子窗口自动降级并记忆 `in-tunnel-icmp-echo`、`in-tunnel-ttl1`（含 RFC 792 8B 截断回包解析）与 `udp-in-gre` 通道，并对同周期多路回包执行原子去重，确保 `ka_drop=0`。
+- **零 `netfilter` 依赖的用户态 NAT 引擎（`src/nat.rs`）**：
+  - **`--nat out`（`OutboundSnatInner`）**：在 `TUN -> GRE` 出站路径（含 64 KB TSO/USO 大包切片前）改写源地址与端口/ICMP ID 并按 RFC 1624 增量更新校验和；入站优先还原回程报文及 ICMPv4/v6 Error 内嵌引用头。
+  - **`--nat exit`（`TcpPortalTable` + `ExitDgramState`）**：对非本机目的地址的入站 WAN UDP 与 ICMPv4/v6 Echo 直接通过 `epoll` 管理的物理口套接字转发并封装 GRE 回包；对 WAN TCP 则改写至每实例/每隧道独立分配的 `198.19.<slot>.<idx>/30` 与 `fd45:4752:4500:<slot>:<idx>::1/126`（`IFA_F_NODAD` + `IP_FREEBIND`/`IPV6_FREEBIND`）`TUN` 门户地址，复用宿主机原生内核 TCP 拥塞控制与 TSO/GRO 栈完成零规则透明代理。
+  - **`--dnat`**：由每隧道专属 `nat-<name>` 工作线程（纳入 `WorkerHealth` 单调看门狗监控）基于非阻塞 `epoll` 将宿主机 TCP/UDP 监听端口绑定转发至 `TUN` 接口目标地址。
+
+## 5. Linux ABI 与 Netlink 自动化
 
 - **跨架构结构体对齐**：`src/sys/linux.rs` 对 `x86_64`（`#[repr(C, packed)]`，12 字节）与非 `x86_64` 架构（如 `aarch64`，`#[repr(C)]`，16 字节）分别定义 `EpollEvent`，并在单测 `test_linux_abi_struct_sizes` 中校验全部 FFI 结构体尺寸。
 - **非破坏式路由所有权与实时邻居联动**：
